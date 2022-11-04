@@ -23,7 +23,8 @@ import os
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
-#from vilmedic.blocks.scorers.NLG import
+from copy import deepcopy
+from vilmedic.blocks.scorers.CheXbert import CheXbert
 import datasets
 import nltk  # Here to have a nice missing dependency error message early on
 import numpy as np
@@ -61,6 +62,27 @@ check_min_version("4.24.0.dev0")
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/summarization/requirements.txt")
 
 logger = logging.getLogger(__name__)
+
+
+class TestCallback(TrainerCallback):
+
+    def __init__(self, trainer, dataset, max_length, num_beams) -> None:
+        super().__init__()
+        self._trainer = trainer
+        self._dataset = dataset
+        self.max_length = max_length
+        self.num_beams = num_beams
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        if control.should_evaluate:
+            control_copy = deepcopy(control)
+            predict_results = self._trainer.predict(
+                self._dataset, metric_key_prefix="predict", max_length=self.max_length, num_beams=self.num_beams
+            )
+            metrics = predict_results.metrics
+            metrics["predict_samples"] = len(self._dataset)
+            self._trainer.log_metrics("predict", metrics)
+            return control_copy
 
 """
 class CTTrainer(Seq2SeqTrainer):
@@ -758,12 +780,18 @@ def main():
 
         result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
         result_bert = metric_bert.compute(predictions=decoded_preds, references=decoded_labels, lang="en")
+        result_chexbert = {}
+        accuracy, accuracy_per_sample, chexbert_all, chexbert_5 = CheXbert(hyps=decoded_preds, refs=decoded_labels)
+        result_chexbert["five_f1"] = chexbert_5["micro avg"]["f1-score"]
+        result_chexbert["all_f1"] = chexbert_all["micro avg"]["f1-score"]
         result = {k: round(v * 100, 4) for k, v in result.items()}
+
         
-        result_bert = {"f1":round(v, 4) for v in result_bert["f1"]}
+        result_bert = {"bertscore_f1":round(v, 4) for v in result_bert["f1"]}
         prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
         result["gen_len"] = np.mean(prediction_lens)
         result.update(result_bert)
+        result.update(result_chexbert)
         return result
 
     # Initialize our Trainer
@@ -776,6 +804,16 @@ def main():
         data_collator=data_collator,
         compute_metrics=compute_metrics if training_args.predict_with_generate else None,
     )
+    results = {}
+    max_length = (
+        training_args.generation_max_length
+        if training_args.generation_max_length is not None
+        else data_args.val_max_target_length
+    )
+    num_beams = data_args.num_beams if data_args.num_beams is not None else training_args.generation_num_beams
+
+    test_callback = TestCallback(trainer, predict_dataset, max_length, num_beams)
+    trainer.add_callback(test_callback)
 
     # Training
     if training_args.do_train:
@@ -798,13 +836,7 @@ def main():
         trainer.save_state()
 
     # Evaluation
-    results = {}
-    max_length = (
-        training_args.generation_max_length
-        if training_args.generation_max_length is not None
-        else data_args.val_max_target_length
-    )
-    num_beams = data_args.num_beams if data_args.num_beams is not None else training_args.generation_num_beams
+
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
         metrics = trainer.evaluate(max_length=max_length, num_beams=num_beams, metric_key_prefix="eval")
