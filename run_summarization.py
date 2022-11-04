@@ -23,17 +23,18 @@ import os
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
-from vilmedic.blocks.scorers.NLG import
+#from vilmedic.blocks.scorers.NLG import
 import datasets
 import nltk  # Here to have a nice missing dependency error message early on
 import numpy as np
 from datasets import load_dataset
 sys.path.append(r'./SimCTGBART/')
-from simctgbart import SimCTGBART
+#from simctgbart import SimCTGBART
 
 import evaluate
 import transformers
 import torch
+from torch import nn
 from filelock import FileLock
 from transformers import (
     AutoConfig,
@@ -61,6 +62,7 @@ require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/summ
 
 logger = logging.getLogger(__name__)
 
+"""
 class CTTrainer(Seq2SeqTrainer):
     def prediction_step(
             self,
@@ -69,7 +71,6 @@ class CTTrainer(Seq2SeqTrainer):
             prediction_loss_only: bool,
             ignore_keys: Optional[List[str]] = None,
     ) -> Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
         Perform an evaluation step on `model` using `inputs`.
         Subclass and override to inject custom behavior.
         Args:
@@ -84,7 +85,6 @@ class CTTrainer(Seq2SeqTrainer):
         Return:
             Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss, logits and
             labels (each being optional).
-        """
 
         if not self.args.predict_with_generate or prediction_loss_only:
             return super().prediction_step(
@@ -187,6 +187,7 @@ class CTTrainer(Seq2SeqTrainer):
             token = decoder_ids.squeeze(dim=-1).item()
             generated.append(token)
         return generated
+"""
 
 
 try:
@@ -756,9 +757,10 @@ def main():
         decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
 
         result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
-        result_bert = metric_bert.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
+        result_bert = metric_bert.compute(predictions=decoded_preds, references=decoded_labels, lang="en")
         result = {k: round(v * 100, 4) for k, v in result.items()}
-        result_bert = {k: round(v * 100, 4) for k, v in result_bert.items()}
+        
+        result_bert = {"f1":round(v, 4) for v in result_bert["f1"]}
         prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
         result["gen_len"] = np.mean(prediction_lens)
         result.update(result_bert)
