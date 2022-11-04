@@ -24,7 +24,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 from copy import deepcopy
-from vilmedic.blocks.scorers.CheXbert import CheXbert
+from vilmedic.blocks.scorers.CheXbert.chexbert import CheXbert
 import datasets
 import nltk  # Here to have a nice missing dependency error message early on
 import numpy as np
@@ -50,6 +50,7 @@ from transformers import (
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
     set_seed,
+    TrainerCallback,
 )
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, is_offline_mode, send_example_telemetry
@@ -781,7 +782,7 @@ def main():
         result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
         result_bert = metric_bert.compute(predictions=decoded_preds, references=decoded_labels, lang="en")
         result_chexbert = {}
-        accuracy, accuracy_per_sample, chexbert_all, chexbert_5 = CheXbert(hyps=decoded_preds, refs=decoded_labels)
+        accuracy, accuracy_per_sample, chexbert_all, chexbert_5 = CheXbert()(hyps=decoded_preds, refs=decoded_labels)
         result_chexbert["five_f1"] = chexbert_5["micro avg"]["f1-score"]
         result_chexbert["all_f1"] = chexbert_all["micro avg"]["f1-score"]
         result = {k: round(v * 100, 4) for k, v in result.items()}
