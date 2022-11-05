@@ -77,7 +77,7 @@ class TestCallback(TrainerCallback):
         self.max_length = max_length
         self.num_beams = num_beams
 
-    def on_evaluate(self, args, state, control, **kwargs):
+    def on_epoch_end(self, args, state, control, **kwargs):
         if control.should_evaluate:
             control_copy = deepcopy(control)
             predict_results = self._trainer.predict(
@@ -786,7 +786,7 @@ def main():
         result_bert = metric_bert.compute(predictions=decoded_preds, references=decoded_labels, lang="en")
         result_radentity = {}
         result_radentity["entity_harmonic_mean"] = RadEntityMatchExact()(refs=decoded_labels, hyps=decoded_preds)[0]
-        result_radentity["nli_harmonic_mean"] = RadEntityNLI()(refs=decoded_labels, hyps=decoded_preds)[0]
+        #result_radentity["nli_harmonic_mean"] = RadEntityNLI()(refs=decoded_labels, hyps=decoded_preds)[0]
         result_radentity["radgraph_simple"], result_radentity["radgraph_partial"], result_radentity["radgraph_complete"] = \
             RadGraph(reward_level="full")(refs=decoded_labels, hyps=decoded_preds)[0]
         result_chexbert = {}
