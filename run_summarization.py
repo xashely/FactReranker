@@ -25,6 +25,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 from copy import deepcopy
 from vilmedic.blocks.scorers.CheXbert.chexbert import CheXbert
+from vilmedic.blocks.scorers.RadEntityMatchExact.RadEntityMatchExact import RadEntityMatchExact
+from vilmedic.blocks.scorers.RadEntityNLI.RadEntityNLI import RadEntityNLI
+from vilmedic.blocks.scorers.RadGraph.RadGraph import RadGraph
 import datasets
 import nltk  # Here to have a nice missing dependency error message early on
 import numpy as np
@@ -781,18 +784,27 @@ def main():
 
         result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
         result_bert = metric_bert.compute(predictions=decoded_preds, references=decoded_labels, lang="en")
+        result_radentity = {}
+        result_radentity["entity_harmonic_mean"] = RadEntityMatchExact()(refs=decoded_labels, hyps=decoded_preds)[0]
+        result_radentity["nli_harmonic_mean"] = RadEntityNLI()(refs=decoded_labels, hyps=decoded_preds)[0]
+        result_radentity["radgraph_simple"], result_radentity["radgraph_partial"], result_radentity["radgraph_complete"] = \
+            RadGraph(reward_level="full")(refs=decoded_labels, hyps=decoded_preds)[0]
         result_chexbert = {}
         accuracy, accuracy_per_sample, chexbert_all, chexbert_5 = CheXbert()(hyps=decoded_preds, refs=decoded_labels)
-        result_chexbert["five_f1"] = chexbert_5["micro avg"]["f1-score"]
-        result_chexbert["all_f1"] = chexbert_all["micro avg"]["f1-score"]
+        result_chexbert["chexbert_five_f1"] = chexbert_5["micro avg"]["f1-score"]
+        result_chexbert["chexbert_all_f1"] = chexbert_all["micro avg"]["f1-score"]
+        result_chexbert["chexbert_all_precision"] = chexbert_all["micro avg"]["precision"]
+        result_chexbert["chexbert_all_precision"] = chexbert_all["micro avg"]["precision"]
+        result_chexbert["chexbert_all_recall"] = chexbert_all["micro avg"]["recall"]
+        result_chexbert["chexbert_all_recall"] = chexbert_all["micro avg"]["recall"]
         result = {k: round(v * 100, 4) for k, v in result.items()}
-
-        
         result_bert = {"bertscore_f1":round(v, 4) for v in result_bert["f1"]}
+
         prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
         result["gen_len"] = np.mean(prediction_lens)
         result.update(result_bert)
         result.update(result_chexbert)
+        result.update(result_radentity)
         return result
 
     # Initialize our Trainer
