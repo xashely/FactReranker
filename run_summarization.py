@@ -32,6 +32,7 @@ import datasets
 import nltk  # Here to have a nice missing dependency error message early on
 import numpy as np
 from datasets import load_dataset
+from transformers.deepspeed import is_deepspeed_zero3_enabled
 sys.path.append(r'./SimCTGBART/')
 #from simctgbart import SimCTGBART
 
@@ -68,6 +69,11 @@ require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/summ
 logger = logging.getLogger(__name__)
 
 
+def get_score(hyp, ref):
+    results = RadGraph(reward_level="partial")(hyp, ref)
+    return results[1]
+
+
 class TestCallback(TrainerCallback):
 
     def __init__(self, trainer, dataset, max_length, num_beams) -> None:
@@ -90,6 +96,33 @@ class TestCallback(TrainerCallback):
 
 
 class CTTrainer(Seq2SeqTrainer):
+    def rerank(self, tokens, candidate_num, origin_tokens):
+        """Rerank and select optimal generated sequence
+
+        Args:
+            tokens: (th.Tensor) (B x N) x L where B is the batch size, N is the candidate sequence number and L is the max generated length
+            candidate_num: # of candidate sequences
+            origin_tokens: the original text
+        Return:
+            (th.Tensor) B x L
+        """
+        overall_batch_size, max_sequence_length = tokens.shape
+        batch_size = overall_batch_size // candidate_num
+
+        decoded_tokens = self.tokenizer.batch_decode(tokens, skip_special_tokens=True)
+        decoded_origin_tokens = self.tokenizer.batch_decode(origin_tokens, skip_special_tokens=True)
+
+        candidates = [decoded_tokens[index::candidate_num] for index in range(candidate_num)]
+
+        scores = [
+            get_score(candidate, decoded_origin_tokens)
+            for candidate in candidates]
+        scores = np.asarray(scores)
+        print(scores)
+
+        # select_index = np.asarray(scores).argmax()
+        return tokens[:batch_size]
+
     def prediction_step(
             self,
             model: nn.Module,
@@ -137,7 +170,7 @@ class CTTrainer(Seq2SeqTrainer):
             gen_kwargs["attention_mask"] = inputs.get("attention_mask", None)
         if "global_attention_mask" in inputs:
             gen_kwargs["global_attention_mask"] = inputs.get("global_attention_mask", None)
-        gen_kwargs["num_return_sequences"] = 5
+        gen_kwargs["num_return_sequences"] = 15
         # prepare generation inputs
         # some encoder-decoder models can have varying encoder's and thus
         # varying model input names
@@ -160,6 +193,7 @@ class CTTrainer(Seq2SeqTrainer):
                 gen_kwargs["max_new_tokens"] + 1
         ):
             generated_tokens = self._pad_tensors_to_max_len(generated_tokens, gen_kwargs["max_new_tokens"] + 1)
+        generated_tokens = self.rerank(generated_tokens, gen_kwargs["num_return_sequences"], generation_inputs)
 
         with torch.no_grad():
             if has_labels:
