@@ -22,7 +22,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 from copy import deepcopy
 from vilmedic.blocks.scorers.CheXbert.chexbert import CheXbert
 from vilmedic.blocks.scorers.RadEntityMatchExact.RadEntityMatchExact import RadEntityMatchExact
@@ -88,7 +88,7 @@ class TestCallback(TrainerCallback):
             self._trainer.log_metrics("predict", metrics)
             return control_copy
 
-"""
+
 class CTTrainer(Seq2SeqTrainer):
     def prediction_step(
             self,
@@ -97,6 +97,7 @@ class CTTrainer(Seq2SeqTrainer):
             prediction_loss_only: bool,
             ignore_keys: Optional[List[str]] = None,
     ) -> Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
         Perform an evaluation step on `model` using `inputs`.
         Subclass and override to inject custom behavior.
         Args:
@@ -111,7 +112,7 @@ class CTTrainer(Seq2SeqTrainer):
         Return:
             Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss, logits and
             labels (each being optional).
-
+        """
         if not self.args.predict_with_generate or prediction_loss_only:
             return super().prediction_step(
                 model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys
@@ -136,7 +137,7 @@ class CTTrainer(Seq2SeqTrainer):
             gen_kwargs["attention_mask"] = inputs.get("attention_mask", None)
         if "global_attention_mask" in inputs:
             gen_kwargs["global_attention_mask"] = inputs.get("global_attention_mask", None)
-
+        gen_kwargs["num_return_sequences"] = 5
         # prepare generation inputs
         # some encoder-decoder models can have varying encoder's and thus
         # varying model input names
@@ -145,12 +146,13 @@ class CTTrainer(Seq2SeqTrainer):
         else:
             generation_inputs = inputs[self.model.main_input_name]
 
-        # generated_tokens = self.model.generate(
-        #     generation_inputs,
-        #     **gen_kwargs,
-        # )
-        dids = torch.LongTensor([self.model.config.eos_token_id, self.model.config.bos_token_id]).unsqueeze(0)
-        generated_tokens = self.ct_search(self.model, generation_inputs, dids, **gen_kwargs)
+        generated_tokens = self.model.generate(
+             generation_inputs,
+             **gen_kwargs,
+        )
+
+        #dids = torch.LongTensor([self.model.config.eos_token_id, self.model.config.bos_token_id]).unsqueeze(0)
+        #generated_tokens = self.ct_search(self.model, generation_inputs, dids, **gen_kwargs)
         # in case the batch is shorter than max length, the output should be padded
         if gen_kwargs.get("max_length") is not None and generated_tokens.shape[-1] < gen_kwargs["max_length"]:
             generated_tokens = self._pad_tensors_to_max_len(generated_tokens, gen_kwargs["max_length"])
@@ -186,7 +188,7 @@ class CTTrainer(Seq2SeqTrainer):
 
         return (loss, generated_tokens, labels)
 
-    def ct_search(self, model, input_ids, decoder_input_ids, **kwargs):
+    def ct_search(self, model, input_ids, decoder_ids, **kwargs):
         model.eval()
         # sanity check
         assert kwargs["alpha"] >= 0. and kwargs["alpha"] <= 1.0
@@ -213,7 +215,7 @@ class CTTrainer(Seq2SeqTrainer):
             token = decoder_ids.squeeze(dim=-1).item()
             generated.append(token)
         return generated
-"""
+
 
 
 try:
@@ -808,7 +810,7 @@ def main():
         return result
 
     # Initialize our Trainer
-    trainer = Seq2SeqTrainer(
+    trainer = CTTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
