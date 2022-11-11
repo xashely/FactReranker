@@ -69,11 +69,6 @@ require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/summ
 logger = logging.getLogger(__name__)
 
 
-def get_score(hyp, ref):
-    results = RadGraph(reward_level="partial")(hyp, ref)
-    return results[1]
-
-
 class TestCallback(TrainerCallback):
 
     def __init__(self, trainer, dataset, max_length, num_beams) -> None:
@@ -96,6 +91,7 @@ class TestCallback(TrainerCallback):
 
 
 class CTTrainer(Seq2SeqTrainer):
+    scorer = None
     def rerank(self, tokens, candidate_num, origin_tokens):
         """Rerank and select optimal generated sequence
 
@@ -106,6 +102,8 @@ class CTTrainer(Seq2SeqTrainer):
         Return:
             (th.Tensor) B x L
         """
+        if self.scorer is None:
+           self.scorer = RadGraph(reward_level="partial")
         overall_batch_size, max_sequence_length = tokens.shape
         batch_size = overall_batch_size // candidate_num
 
@@ -113,15 +111,18 @@ class CTTrainer(Seq2SeqTrainer):
         decoded_origin_tokens = self.tokenizer.batch_decode(origin_tokens, skip_special_tokens=True)
 
         candidates = [decoded_tokens[index::candidate_num] for index in range(candidate_num)]
-
+        #print(candidates)
         scores = [
-            get_score(candidate, decoded_origin_tokens)
+            self.scorer(candidate, decoded_origin_tokens)[1]
             for candidate in candidates]
         scores = np.asarray(scores)
-        print(scores)
 
-        # select_index = np.asarray(scores).argmax()
-        return tokens[:batch_size]
+        select_index = scores.argmax(axis=0)
+        select_index = select_index + np.arange(batch_size) * candidate_num
+        select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
+        #print(select_index)
+        #print(select_tokens)
+        return select_tokens
 
     def prediction_step(
             self,
@@ -170,7 +171,7 @@ class CTTrainer(Seq2SeqTrainer):
             gen_kwargs["attention_mask"] = inputs.get("attention_mask", None)
         if "global_attention_mask" in inputs:
             gen_kwargs["global_attention_mask"] = inputs.get("global_attention_mask", None)
-        gen_kwargs["num_return_sequences"] = 15
+        gen_kwargs["num_return_sequences"] = 5
         # prepare generation inputs
         # some encoder-decoder models can have varying encoder's and thus
         # varying model input names

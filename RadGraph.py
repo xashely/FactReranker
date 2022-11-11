@@ -82,6 +82,7 @@ class RadGraph(nn.Module):
         results = manager.run()
 
         # Postprocessing
+        print (results)
         inference_dict = postprocess_reports(results)
         # pickle.dump(inference_dict, open("./temp", "wb"))
 
