@@ -845,7 +845,7 @@ def main():
         return result
 
     # Initialize our Trainer
-    trainer = CTTrainer(
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
