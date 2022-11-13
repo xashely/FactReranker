@@ -103,15 +103,15 @@ class CTTrainer(Seq2SeqTrainer):
         original_outputs = super().compute_loss(model, inputs, False)
         loss = original_outputs
 
-        #encoder_input_ids = inputs['input_ids']
+        encoder_input_ids = inputs['input_ids']
         #num_beams = self.model.config.num_beams
-
-        #encoder_outputs = model.get_encoder()(
-        #    encoder_input_ids.repeat_interleave(num_beams, dim=0), return_dict=True
-        #)
+        num_beams = 5
+        encoder_outputs = model.get_encoder()(
+            encoder_input_ids.repeat_interleave(num_beams, dim=0), return_dict=True
+        )
 
         inputs = self._prepare_inputs(inputs)
-        num_beams = 5
+
         model_kwargs = {
             "max_length": self.model.config.max_length,
             "num_beams": num_beams,
@@ -129,21 +129,19 @@ class CTTrainer(Seq2SeqTrainer):
              **model_kwargs,
         )
 
-        contrastive_loss = self.calculate_contrastive_loss(num_beams, outputs, labels)
+        contrastive_loss = self.calculate_contrastive_loss(encoder_outputs,num_beams, outputs, labels)
 
         return loss+contrastive_loss
     
-    def calculate_contrastive_loss(self, num_beams, beam_outputs, labels):
+    def calculate_contrastive_loss(self, encoder_outputs, num_beams, beam_outputs, labels):
         last_hidden_state = beam_outputs['decoder_hidden_states'][-1][-1]
-        encoder_output = beam_outputs['encoder_hidden_states'][-1]
-        print(last_hidden_state.shape, encoder_output.shape)
         
         labels = torch.where(labels != -100, labels, self.tokenizer.pad_token_id)
         #print(labels.shape)
         #print(beam_outputs["sequences"].shape)
         candidate_labels = self.calculate_score(beam_outputs["sequences"], num_beams, labels)
         #print(labels.shape,beam_outputs["sequences"].shape)
-        logits = torch.matmul(last_hidden_state, torch.unsqueeze(encoder_output, -1)).squeeze(-1)
+        logits = torch.matmul(last_hidden_state, torch.unsqueeze(encoder_outputs, -1)).squeeze(-1)
         contrastive_loss = nn.CrossEntropyLoss()(logits, candidate_labels)
         return contrastive_loss
 
