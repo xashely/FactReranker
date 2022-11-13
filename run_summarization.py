@@ -111,24 +111,26 @@ class CTTrainer(Seq2SeqTrainer):
             encoder_input_ids.repeat_interleave(num_beams, dim=0), return_dict=True
         )
 
-        model_kwargs = {
-            "encoder_outputs": encoder_outputs,
-        }
+        inputs = self._prepare_inputs(inputs)
 
-        beam_scorer = BeamSearchScorer(
-            batch_size=labels.shape[0], num_beams=num_beams, device=model.device
+        # XXX: adapt synced_gpus for fairscale as well
+        gen_kwargs = self._gen_kwargs.copy()
+        if gen_kwargs.get("max_length") is None and gen_kwargs.get("max_new_tokens") is None:
+            gen_kwargs["max_length"] = self.model.config.max_length
+        gen_kwargs["num_beams"] = 5
+        gen_kwargs["output_hidden_states"] = True
+        gen_kwargs["return_dict_in_generate"] = True
+        if hasattr(self.model, "encoder") and self.model.encoder.main_input_name != self.model.main_input_name:
+            generation_inputs = inputs[self.model.encoder.main_input_name]
+        else:
+            generation_inputs = inputs[self.model.main_input_name]
+
+        outputs = self.model.generate(
+             generation_inputs,
+             **gen_kwargs,
         )
 
-        logits_processor = LogitsProcessorList(
-            [
-                MinLengthLogitsProcessor(5, eos_token_id=model.config.eos_token_id)
-            ]
-        )
-
-        beam_outputs = model.beam_search(input_ids, beam_scorer, logits_processor=logits_processor, output_hidden_states=True, return_dict_in_generate=True, **model_kwargs)
-
-
-        contrastive_loss = self.calculate_contrastive_loss(encoder_outputs, num_beams, beam_outputs, labels)
+        contrastive_loss = self.calculate_contrastive_loss(encoder_outputs, num_beams, outputs, labels)
 
         return loss+contrastive_loss
     def calculate_contrastive_loss(self, encoder_outputs, num_beams, beam_outputs, labels):
