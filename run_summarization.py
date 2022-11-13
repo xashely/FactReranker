@@ -33,8 +33,11 @@ import nltk  # Here to have a nice missing dependency error message early on
 import numpy as np
 from datasets import load_dataset
 from transformers.deepspeed import is_deepspeed_zero3_enabled
-sys.path.append(r'./SimCTGBART/')
-#from simctgbart import SimCTGBART
+from CheXbert import CheXbert
+
+LABELS = ["Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity", "Lung Lesion", "Edema", "Consolidation",
+          "Pneumonia", "Atelectasis", "Pneumothorax", "Pleural Effusion", "Pleural Other", "Fracture",
+          "Support Devices", "No Finding"]
 
 import evaluate
 import transformers
@@ -55,6 +58,9 @@ from transformers import (
     Seq2SeqTrainingArguments,
     set_seed,
     TrainerCallback,
+    LogitsProcessorList,
+    MinLengthLogitsProcessor,
+    BeamSearchScorer,
 )
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, is_offline_mode, send_example_telemetry
@@ -92,16 +98,63 @@ class TestCallback(TrainerCallback):
 
 class CTTrainer(Seq2SeqTrainer):
     scorer = None
-    def rerank(self, tokens, candidate_num, origin_tokens):
-        """Rerank and select optimal generated sequence
+    def compute_loss(self, model, inputs):
+        labels = inputs.get("labels")
+        original_outputs = super().compute_loss(model, inputs, False)
+        loss = original_outputs
 
-        Args:
-            tokens: (th.Tensor) (B x N) x L where B is the batch size, N is the candidate sequence number and L is the max generated length
-            candidate_num: # of candidate sequences
-            origin_tokens: the original text
-        Return:
-            (th.Tensor) B x L
-        """
+        encoder_input_ids = inputs
+        num_beams = 5
+        input_ids = torch.ones((num_beams, 1), device=model.device, dtype=torch.long)
+        input_ids = input_ids * model.config.decoder_start_token_id
+
+        encoder_outputs = model.get_encoder()(
+            encoder_input_ids.repeat_interleave(num_beams, dim=0), return_dict=True
+        )
+
+        model_kwargs = {
+            "encoder_outputs": encoder_outputs,
+            "output_hidden_states": True
+        }
+
+        beam_scorer = BeamSearchScorer(
+            batch_size=1, num_beams=num_beams, device=model.device
+        )
+
+        logits_processor = LogitsProcessorList(
+            [
+                MinLengthLogitsProcessor(5, eos_token_id=model.config.eos_token_id)
+            ]
+        )
+
+        beam_outputs = model.beam_search(input_ids, beam_scorer, logits_processor=logits_processor, **model_kwargs)
+
+
+        contrastive_loss = self.calculate_contrastive_loss(encoder_outputs, num_beams, beam_outputs, labels)
+
+        return loss+contrastive_loss
+    def calculate_contrastive_loss(self, encoder_outputs, num_beams, beam_outputs, labels):
+        candidate_labels = self.calculate_score(beam_outputs["sequences"], num_beams, labels)
+        print (f"decoder shape is {beam_outputs['decoder_hidden_states'].shape}, encoder shape is {encoder_outputs.shape}")
+        logits = torch.matmul(beam_outputs["decoder_hidden_states"], torch.unsqueeze(encoder_outputs, -1)).squeeze(-1)
+        contrastive_loss = nn.CrossEntropyLoss()(logits, candidate_labels)
+        return contrastive_loss
+
+
+    def rerank(self, tokens, tokens_embeddings, origin_tokens, candidate_num):
+        overall_batch_size, max_sequence_length = tokens.shape
+        batch_size = overall_batch_size // candidate_num
+        scores = torch.matmul(tokens_embeddings, torch.unsqueeze(origin_tokens, -1)).squeeze(-1))
+        scores = scores.argmax(axis=0).long()
+        select_index = torch.Tensor(scores.argmax(axis=0)).long()
+        select_index = select_index + np.arange(batch_size) * candidate_num
+        select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
+        # print(select_index)
+        # print(select_tokens)
+        return select_tokens
+
+
+    def calculate_score(self, tokens, candidate_num, origin_tokens):
         if self.scorer is None:
            self.scorer = RadGraph(reward_level="partial")
         overall_batch_size, max_sequence_length = tokens.shape
@@ -116,13 +169,12 @@ class CTTrainer(Seq2SeqTrainer):
             self.scorer(candidate, decoded_origin_tokens)[1]
             for candidate in candidates]
         scores = np.asarray(scores)
-
-        select_index = scores.argmax(axis=0)
-        select_index = select_index + np.arange(batch_size) * candidate_num
-        select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
+        select_index = torch.Tensor(scores.argmax(axis=0)).long()
+        #select_index = select_index + np.arange(batch_size) * candidate_num
+        #select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
         #print(select_index)
         #print(select_tokens)
-        return select_tokens
+        return select_index
 
     def prediction_step(
             self,
@@ -173,6 +225,7 @@ class CTTrainer(Seq2SeqTrainer):
         if "global_attention_mask" in inputs:
             gen_kwargs["global_attention_mask"] = inputs.get("global_attention_mask", None)
         gen_kwargs["num_return_sequences"] = 5
+        gen_kwargs["output_hidden_states"] = True
         # prepare generation inputs
         # some encoder-decoder models can have varying encoder's and thus
         # varying model input names
@@ -181,10 +234,12 @@ class CTTrainer(Seq2SeqTrainer):
         else:
             generation_inputs = inputs[self.model.main_input_name]
 
-        generated_tokens = self.model.generate(
+        outputs = self.model.generate(
              generation_inputs,
              **gen_kwargs,
         )
+
+        generated_tokens = outputs["sequences"]
 
         #dids = torch.LongTensor([self.model.config.eos_token_id, self.model.config.bos_token_id]).unsqueeze(0)
         #generated_tokens = self.ct_search(self.model, generation_inputs, dids, **gen_kwargs)
@@ -195,7 +250,15 @@ class CTTrainer(Seq2SeqTrainer):
                 gen_kwargs["max_new_tokens"] + 1
         ):
             generated_tokens = self._pad_tensors_to_max_len(generated_tokens, gen_kwargs["max_new_tokens"] + 1)
-        generated_tokens = self.rerank(generated_tokens, gen_kwargs["num_return_sequences"], generation_inputs)
+
+        encoder_input_ids = generation_inputs
+        input_ids = torch.ones((gen_kwargs["num_return_sequences"], 1), device=model.device, dtype=torch.long)
+
+        encoder_outputs = model.get_encoder()(
+            encoder_input_ids.repeat_interleave(5, dim=0), return_dict=True
+        )
+
+        generated_tokens = self.rerank(generated_tokens, outputs["decoder_hidden_states"], encoder_outputs, gen_kwargs["num_return_sequences"])
 
         with torch.no_grad():
             if has_labels:
@@ -863,8 +926,8 @@ def main():
     )
     num_beams = data_args.num_beams if data_args.num_beams is not None else training_args.generation_num_beams
 
-    test_callback = TestCallback(trainer, predict_dataset, max_length, num_beams)
-    trainer.add_callback(test_callback)
+    #test_callback = TestCallback(trainer, predict_dataset, max_length, num_beams)
+    #trainer.add_callback(test_callback)
 
     # Training
     if training_args.do_train:
