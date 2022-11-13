@@ -104,22 +104,20 @@ class CTTrainer(Seq2SeqTrainer):
         loss = original_outputs
 
         encoder_input_ids = inputs['input_ids']
-        num_beams = 5
-        input_ids = torch.ones((num_beams, 1), device=model.device, dtype=torch.long)
-        input_ids = input_ids * model.config.decoder_start_token_id
+        num_beams = self.model.config.num_beams
+
         encoder_outputs = model.get_encoder()(
             encoder_input_ids.repeat_interleave(num_beams, dim=0), return_dict=True
         )
 
         inputs = self._prepare_inputs(inputs)
 
-        # XXX: adapt synced_gpus for fairscale as well
-        gen_kwargs = self._gen_kwargs.copy()
-        if gen_kwargs.get("max_length") is None and gen_kwargs.get("max_new_tokens") is None:
-            gen_kwargs["max_length"] = self.model.config.max_length
-        gen_kwargs["num_beams"] = 5
-        gen_kwargs["output_hidden_states"] = True
-        gen_kwargs["return_dict_in_generate"] = True
+        model_kwargs = {
+            "max_length": self.model.config.max_length,
+            "num_beams": self.model.config.num_beams,
+            "output_hidden_states": True,
+            "return_dict_in_generate": True,
+        }
         if hasattr(self.model, "encoder") and self.model.encoder.main_input_name != self.model.main_input_name:
             generation_inputs = inputs[self.model.encoder.main_input_name]
         else:
@@ -127,7 +125,7 @@ class CTTrainer(Seq2SeqTrainer):
 
         outputs = self.model.generate(
              generation_inputs,
-             **gen_kwargs,
+             **model_kwargs,
         )
 
         contrastive_loss = self.calculate_contrastive_loss(encoder_outputs, num_beams, outputs, labels)
