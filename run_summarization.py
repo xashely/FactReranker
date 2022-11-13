@@ -33,11 +33,11 @@ import nltk  # Here to have a nice missing dependency error message early on
 import numpy as np
 from datasets import load_dataset
 from transformers.deepspeed import is_deepspeed_zero3_enabled
-from CheXbert import CheXbert
+#from CheXbert import CheXbert
 
-LABELS = ["Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity", "Lung Lesion", "Edema", "Consolidation",
-          "Pneumonia", "Atelectasis", "Pneumothorax", "Pleural Effusion", "Pleural Other", "Fracture",
-          "Support Devices", "No Finding"]
+#LABELS = ["Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity", "Lung Lesion", "Edema", "Consolidation",
+#          "Pneumonia", "Atelectasis", "Pneumothorax", "Pleural Effusion", "Pleural Other", "Fracture",
+#          "Support Devices", "No Finding"]
 
 import evaluate
 import transformers
@@ -103,22 +103,20 @@ class CTTrainer(Seq2SeqTrainer):
         original_outputs = super().compute_loss(model, inputs, False)
         loss = original_outputs
 
-        encoder_input_ids = inputs
+        encoder_input_ids = inputs['input_ids']
         num_beams = 5
         input_ids = torch.ones((num_beams, 1), device=model.device, dtype=torch.long)
         input_ids = input_ids * model.config.decoder_start_token_id
-
         encoder_outputs = model.get_encoder()(
             encoder_input_ids.repeat_interleave(num_beams, dim=0), return_dict=True
         )
 
         model_kwargs = {
             "encoder_outputs": encoder_outputs,
-            "output_hidden_states": True
         }
 
         beam_scorer = BeamSearchScorer(
-            batch_size=1, num_beams=num_beams, device=model.device
+            batch_size=labels.shape[0], num_beams=num_beams, device=model.device
         )
 
         logits_processor = LogitsProcessorList(
@@ -127,16 +125,20 @@ class CTTrainer(Seq2SeqTrainer):
             ]
         )
 
-        beam_outputs = model.beam_search(input_ids, beam_scorer, logits_processor=logits_processor, **model_kwargs)
+        beam_outputs = model.beam_search(input_ids, beam_scorer, logits_processor=logits_processor, output_hidden_states=True, return_dict_in_generate=True, **model_kwargs)
 
 
         contrastive_loss = self.calculate_contrastive_loss(encoder_outputs, num_beams, beam_outputs, labels)
 
         return loss+contrastive_loss
     def calculate_contrastive_loss(self, encoder_outputs, num_beams, beam_outputs, labels):
+        last_hidden_state = beam_outputs['decoder_hidden_states'][-1][-1]
+        encoder_output = encoder_outputs["last_hidden_state"]
+        labels = torch.where(labels != -100, labels, self.tokenizer.pad_token_id)
+        print(labels.shape)
+        print(beam_outputs["sequences"].shape)
         candidate_labels = self.calculate_score(beam_outputs["sequences"], num_beams, labels)
-        print (f"decoder shape is {beam_outputs['decoder_hidden_states'].shape}, encoder shape is {encoder_outputs.shape}")
-        logits = torch.matmul(beam_outputs["decoder_hidden_states"], torch.unsqueeze(encoder_outputs, -1)).squeeze(-1)
+        logits = torch.matmul(last_hidden_state, torch.unsqueeze(encoder_output, -1)).squeeze(-1)
         contrastive_loss = nn.CrossEntropyLoss()(logits, candidate_labels)
         return contrastive_loss
 
@@ -144,7 +146,7 @@ class CTTrainer(Seq2SeqTrainer):
     def rerank(self, tokens, tokens_embeddings, origin_tokens, candidate_num):
         overall_batch_size, max_sequence_length = tokens.shape
         batch_size = overall_batch_size // candidate_num
-        scores = torch.matmul(tokens_embeddings, torch.unsqueeze(origin_tokens, -1)).squeeze(-1))
+        scores = torch.matmul(tokens_embeddings, torch.unsqueeze(origin_tokens, -1)).squeeze(-1)
         scores = scores.argmax(axis=0).long()
         select_index = torch.Tensor(scores.argmax(axis=0)).long()
         select_index = select_index + np.arange(batch_size) * candidate_num
