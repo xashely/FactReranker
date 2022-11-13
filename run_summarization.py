@@ -111,11 +111,11 @@ class CTTrainer(Seq2SeqTrainer):
         #)
 
         inputs = self._prepare_inputs(inputs)
-
+        num_beams = 5
         model_kwargs = {
             "max_length": self.model.config.max_length,
-            "num_beams": self.model.config.num_beams,
-            "num_return_sequences": self.model.config.num_beams,
+            "num_beams": num_beams,
+            "num_return_sequences": num_beams,
             "output_hidden_states": True,
             "return_dict_in_generate": True,
         }
@@ -129,17 +129,20 @@ class CTTrainer(Seq2SeqTrainer):
              **model_kwargs,
         )
 
-        contrastive_loss = self.calculate_contrastive_loss(self.model.config.num_beams, outputs, labels)
+        contrastive_loss = self.calculate_contrastive_loss(num_beams, outputs, labels)
 
         return loss+contrastive_loss
-    def calculate_contrastive_loss(self, encoder_outputs, num_beams, beam_outputs, labels):
-        last_hidden_state = beam_outputs['decoder_hidden_states'][-1]
-        encoder_output = beam_outputs["last_hidden_state"]
+    
+    def calculate_contrastive_loss(self, num_beams, beam_outputs, labels):
+        last_hidden_state = beam_outputs['decoder_hidden_states'][-1][-1]
+        encoder_output = beam_outputs['encoder_hidden_states'][-1]
         print(last_hidden_state.shape, encoder_output.shape)
+        
         labels = torch.where(labels != -100, labels, self.tokenizer.pad_token_id)
-        print(labels.shape)
-        print(beam_outputs["sequences"].shape)
+        #print(labels.shape)
+        #print(beam_outputs["sequences"].shape)
         candidate_labels = self.calculate_score(beam_outputs["sequences"], num_beams, labels)
+        #print(labels.shape,beam_outputs["sequences"].shape)
         logits = torch.matmul(last_hidden_state, torch.unsqueeze(encoder_output, -1)).squeeze(-1)
         contrastive_loss = nn.CrossEntropyLoss()(logits, candidate_labels)
         return contrastive_loss
@@ -163,12 +166,12 @@ class CTTrainer(Seq2SeqTrainer):
            self.scorer = RadGraph(reward_level="partial")
         overall_batch_size, max_sequence_length = tokens.shape
         batch_size = overall_batch_size // candidate_num
-
+        
         decoded_tokens = self.tokenizer.batch_decode(tokens, skip_special_tokens=True)
         decoded_origin_tokens = self.tokenizer.batch_decode(origin_tokens, skip_special_tokens=True)
 
         candidates = [decoded_tokens[index::candidate_num] for index in range(candidate_num)]
-        #print(candidates)
+        #print(len(candidates))
         scores = [
             self.scorer(candidate, decoded_origin_tokens)[1]
             for candidate in candidates]
