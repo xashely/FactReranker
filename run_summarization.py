@@ -103,18 +103,19 @@ class CTTrainer(Seq2SeqTrainer):
         original_outputs = super().compute_loss(model, inputs, False)
         loss = original_outputs
 
-        encoder_input_ids = inputs['input_ids']
-        num_beams = self.model.config.num_beams
+        #encoder_input_ids = inputs['input_ids']
+        #num_beams = self.model.config.num_beams
 
-        encoder_outputs = model.get_encoder()(
-            encoder_input_ids.repeat_interleave(num_beams, dim=0), return_dict=True
-        )
+        #encoder_outputs = model.get_encoder()(
+        #    encoder_input_ids.repeat_interleave(num_beams, dim=0), return_dict=True
+        #)
 
         inputs = self._prepare_inputs(inputs)
 
         model_kwargs = {
             "max_length": self.model.config.max_length,
             "num_beams": self.model.config.num_beams,
+            "num_return_sequences": self.model.config.num_beams,
             "output_hidden_states": True,
             "return_dict_in_generate": True,
         }
@@ -128,12 +129,13 @@ class CTTrainer(Seq2SeqTrainer):
              **model_kwargs,
         )
 
-        contrastive_loss = self.calculate_contrastive_loss(encoder_outputs, num_beams, outputs, labels)
+        contrastive_loss = self.calculate_contrastive_loss(self.model.config.num_beams, outputs, labels)
 
         return loss+contrastive_loss
     def calculate_contrastive_loss(self, encoder_outputs, num_beams, beam_outputs, labels):
-        last_hidden_state = beam_outputs['decoder_hidden_states'][-1][-1]
-        encoder_output = encoder_outputs["last_hidden_state"]
+        last_hidden_state = beam_outputs['decoder_hidden_states'][-1]
+        encoder_output = beam_outputs["last_hidden_state"]
+        print(last_hidden_state.shape, encoder_output.shape)
         labels = torch.where(labels != -100, labels, self.tokenizer.pad_token_id)
         print(labels.shape)
         print(beam_outputs["sequences"].shape)
