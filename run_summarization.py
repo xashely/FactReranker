@@ -145,7 +145,7 @@ class CTTrainer(Seq2SeqTrainer):
         #print(labels.shape,beam_outputs["sequences"].shape)
         #print(encoder_outputs.shape)
         logits = torch.matmul(last_hidden_state, encoder_outputs.unsqueeze(-1)).squeeze(-1)
-        logits = torch.reshape(logits, (candidate_labels.shape[0],num_beams)).to(device=candidate_labels.device)
+        logits = torch.reshape(logits, (candidate_labels.shape[0], num_beams)).to(device=candidate_labels.device)
         contrastive_loss = nn.CrossEntropyLoss()(logits, candidate_labels)
         return contrastive_loss
 
@@ -154,7 +154,7 @@ class CTTrainer(Seq2SeqTrainer):
         overall_batch_size, max_sequence_length = tokens.shape
         batch_size = overall_batch_size // candidate_num
         scores = torch.matmul(tokens_embeddings, torch.unsqueeze(origin_tokens, -1)).squeeze(-1)
-        scores = scores.argmax(axis=0).long()
+        scores = torch.reshape(scores, (batch_size,candidate_num)).argmax(axis=0).long()
         select_index = torch.Tensor(scores.argmax(axis=0)).long()
         select_index = select_index + np.arange(batch_size) * candidate_num
         select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
@@ -245,6 +245,8 @@ class CTTrainer(Seq2SeqTrainer):
         else:
             generation_inputs = inputs[self.model.main_input_name]
 
+        gen_kwargs["output_hidden_states"] = True
+
         outputs = self.model.generate(
              generation_inputs,
              **gen_kwargs,
@@ -262,14 +264,12 @@ class CTTrainer(Seq2SeqTrainer):
         ):
             generated_tokens = self._pad_tensors_to_max_len(generated_tokens, gen_kwargs["max_new_tokens"] + 1)
 
-        encoder_input_ids = generation_inputs
-        input_ids = torch.ones((gen_kwargs["num_return_sequences"], 1), device=model.device, dtype=torch.long)
+        #encoder_input_ids = generation_inputs
+        #input_ids = torch.ones((gen_kwargs["num_return_sequences"], 1), device=model.device, dtype=torch.long)
 
-        encoder_outputs = model.get_encoder()(
-            encoder_input_ids.repeat_interleave(5, dim=0), return_dict=True
-        )
-
-        generated_tokens = self.rerank(generated_tokens, outputs["decoder_hidden_states"], encoder_outputs, gen_kwargs["num_return_sequences"])
+        encoder_outputs = outputs["encoder_hidden_states"][-1]
+        encoder_outputs = torch.mean(encoder_outputs.repeat_interleave(num_beams, dim=0), 1)
+        generated_tokens = self.rerank(generated_tokens, outputs["decoder_hidden_states"][-1][-1], encoder_outputs, gen_kwargs["num_return_sequences"])
 
         with torch.no_grad():
             if has_labels:
