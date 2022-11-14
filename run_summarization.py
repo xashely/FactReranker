@@ -103,12 +103,12 @@ class CTTrainer(Seq2SeqTrainer):
         original_outputs = super().compute_loss(model, inputs, False)
         loss = original_outputs
 
-        encoder_input_ids = inputs['input_ids']
+        #encoder_input_ids = inputs['input_ids']
         #num_beams = self.model.config.num_beams
         num_beams = 5
-        encoder_outputs = model.get_encoder()(
-            encoder_input_ids.repeat_interleave(num_beams, dim=0), return_dict=True
-        )
+        #encoder_outputs = model.get_encoder()(
+        #    encoder_input_ids.repeat_interleave(num_beams, dim=0), return_dict=True
+        #)
 
         inputs = self._prepare_inputs(inputs)
 
@@ -129,21 +129,20 @@ class CTTrainer(Seq2SeqTrainer):
              **model_kwargs,
         )
 
-        contrastive_loss = self.calculate_contrastive_loss(encoder_outputs,num_beams, outputs, labels)
-        print("contra_loss:", loss, 0.5*contrastive_loss)
+        contrastive_loss = self.calculate_contrastive_loss(num_beams, outputs, labels)
+        #print("contra_loss:", loss, 0.5*contrastive_loss)
         return loss+0.5*contrastive_loss
     
-    def calculate_contrastive_loss(self, encoder_outputs, num_beams, beam_outputs, labels):
+    def calculate_contrastive_loss(self, num_beams, beam_outputs, labels):
         last_hidden_state = beam_outputs['decoder_hidden_states'][-1][-1]
-        
-        encoder_outputs = torch.mean(encoder_outputs["last_hidden_state"],1)
+        encoder_outputs = beam_outputs["last_hidden_state"][-1]
+        encoder_outputs = encoder_outputs.repeat_interleave(num_beams, dim=0)
         labels = torch.where(labels != -100, labels, self.tokenizer.pad_token_id)
         #print(labels.shape)
         #print(beam_outputs["sequences"].shape)
         candidate_labels = self.calculate_score(beam_outputs["sequences"], num_beams, labels)
         #print(labels.shape,beam_outputs["sequences"].shape)
         #print(encoder_outputs.shape)
-        print(candidate_labels)
         logits = torch.matmul(last_hidden_state, encoder_outputs.unsqueeze(-1)).squeeze(-1)
         logits = torch.reshape(logits, (candidate_labels.shape[0],num_beams)).to(device=candidate_labels.device)
         contrastive_loss = nn.CrossEntropyLoss()(logits, candidate_labels)
