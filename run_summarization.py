@@ -135,8 +135,9 @@ class CTTrainer(Seq2SeqTrainer):
     
     def calculate_contrastive_loss(self, num_beams, beam_outputs, labels):
         last_hidden_state = beam_outputs['decoder_hidden_states'][-1][-1]
-        encoder_outputs = beam_outputs["last_hidden_state"][-1]
-        encoder_outputs = encoder_outputs.repeat_interleave(num_beams, dim=0)
+        encoder_outputs = beam_outputs["encoder_hidden_states"][-1]
+        #print(encoder_outputs.shape)
+        encoder_outputs = torch.mean(encoder_outputs.repeat_interleave(num_beams, dim=0),1)
         labels = torch.where(labels != -100, labels, self.tokenizer.pad_token_id)
         #print(labels.shape)
         #print(beam_outputs["sequences"].shape)
@@ -172,9 +173,9 @@ class CTTrainer(Seq2SeqTrainer):
         decoded_origin_tokens = self.tokenizer.batch_decode(origin_tokens, skip_special_tokens=True)
 
         candidates = [decoded_tokens[index::candidate_num] for index in range(candidate_num)]
-        #print(len(candidates))
-        candidates = [[v if v != ' ' else '' for v in val] for val in candidates]
-        print(candidates, decoded_origin_tokens)
+        candidates = [[v.strip() for v in val] for val in candidates]
+        #print(candidates)
+        #print(candidates, decoded_origin_tokens)
         scores = [
             self.scorer(candidate, decoded_origin_tokens)[1]
             for candidate in candidates]
