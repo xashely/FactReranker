@@ -103,35 +103,52 @@ class CTTrainer(Seq2SeqTrainer):
         original_outputs = super().compute_loss(model, inputs, False)
         loss = original_outputs
 
-        #encoder_input_ids = inputs['input_ids']
+        encoder_input_ids = inputs['input_ids']
         #num_beams = self.model.config.num_beams
         num_beams = 5
-        #encoder_outputs = model.get_encoder()(
-        #    encoder_input_ids.repeat_interleave(num_beams, dim=0), return_dict=True
-        #)
-
-        inputs = self._prepare_inputs(inputs)
-
-        model_kwargs = {
-            "max_length": self.model.config.max_length,
-            "num_beams": num_beams,
-            "num_return_sequences": num_beams,
-            "output_hidden_states": True,
-            "return_dict_in_generate": True,
-        }
-        if hasattr(self.model, "encoder") and self.model.encoder.main_input_name != self.model.main_input_name:
-            generation_inputs = inputs[self.model.encoder.main_input_name]
-        else:
-            generation_inputs = inputs[self.model.main_input_name]
-
-        outputs = self.model.generate(
-             generation_inputs,
-             **model_kwargs,
+        input_ids = torch.ones((num_beams, 1), device=model.device, dtype=torch.long)
+        input_ids = input_ids * model.config.decoder_start_token_id
+        encoder_outputs = model.module.get_encoder()(
+            encoder_input_ids.repeat_interleave(num_beams, dim=0), return_dict=True
         )
+        model_kwargs = {
+            "encoder_outputs": encoder_outputs,
+        }
+        beam_scorer = BeamSearchScorer(
+            batch_size=labels.shape[0], num_beams=num_beams, device=model.module.device
+        )
+        logits_processor = LogitsProcessorList(
+            [
+                MinLengthLogitsProcessor(5, eos_token_id=model.config.eos_token_id)
+            ]
+        )
+        beam_outputs = model.beam_search(input_ids, beam_scorer, logits_processor=logits_processor,
+                                         output_hidden_states=True, return_dict_in_generate=True, **model_kwargs)
 
-        contrastive_loss = self.calculate_contrastive_loss(num_beams, outputs, labels)
+        contrastive_loss = self.calculate_contrastive_loss(num_beams, beam_outputs, labels)
+
+        # inputs = self._prepare_inputs(inputs)
+        #
+        # model_kwargs = {
+        #     "max_length": self.model.config.max_length,
+        #     "num_beams": num_beams,
+        #     "num_return_sequences": num_beams,
+        #     "output_hidden_states": True,
+        #     "return_dict_in_generate": True,
+        # }
+        # if hasattr(self.model, "encoder") and self.model.encoder.main_input_name != self.model.main_input_name:
+        #     generation_inputs = inputs[self.model.encoder.main_input_name]
+        # else:
+        #     generation_inputs = inputs[self.model.main_input_name]
+        #
+        # outputs = self.model.generate(
+        #      generation_inputs,
+        #      **model_kwargs,
+        # )
+
+        # contrastive_loss = self.calculate_contrastive_loss(num_beams, outputs, labels)
         #print("contra_loss:", loss, 0.5*contrastive_loss)
-        return loss+0.5*contrastive_loss
+        return loss+0.2*contrastive_loss
     
     def calculate_contrastive_loss(self, num_beams, beam_outputs, labels):
         last_hidden_state = beam_outputs['decoder_hidden_states'][-1][-1]
