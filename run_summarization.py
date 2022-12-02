@@ -18,6 +18,8 @@ Fine-tuning the library models for sequence to sequence.
 """
 # You can also adapt this script on your own sequence to sequence task. Pointers for this are left as comments.
 
+import wandb
+import arrow
 import logging
 import os
 import sys
@@ -27,7 +29,8 @@ from copy import deepcopy
 from vilmedic.blocks.scorers.CheXbert.chexbert import CheXbert
 from vilmedic.blocks.scorers.RadEntityMatchExact.RadEntityMatchExact import RadEntityMatchExact
 from vilmedic.blocks.scorers.RadEntityNLI.RadEntityNLI import RadEntityNLI
-from vilmedic.blocks.scorers.RadGraph.RadGraph import RadGraph
+# from vilmedic.blocks.scorers.RadGraph.RadGraph import RadGraph
+from RadGraph import RadGraph
 import datasets
 import nltk  # Here to have a nice missing dependency error message early on
 import numpy as np
@@ -66,6 +69,7 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, is_offline_mode, send_example_telemetry
 from transformers.utils.versions import require_version
 
+sys.path.append(os.path.join(os.path.dirname(__file__)))
 model_path = "facebook/bart-base"
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.24.0.dev0")
@@ -73,6 +77,8 @@ check_min_version("4.24.0.dev0")
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/summarization/requirements.txt")
 
 logger = logging.getLogger(__name__)
+
+
 
 
 class TestCallback(TrainerCallback):
@@ -97,111 +103,99 @@ class TestCallback(TrainerCallback):
 
 
 class CTTrainer(Seq2SeqTrainer):
-    scorer = None
+    scorer = RadGraph(reward_level="complete", cuda=torch.cuda.current_device(), batch_size=1)
+    sequences = []
+    logits = []
+    hyps = []
     def compute_loss(self, model, inputs):
         labels = inputs.get("labels")
-        original_outputs = super().compute_loss(model, inputs, False)
-        loss = original_outputs
+        loss, original_outputs = super().compute_loss(model, inputs, True)
+        if self.state.epoch <= 0:
+            return loss
+        # return loss
+        start = arrow.now()
 
         encoder_input_ids = inputs['input_ids']
-        #num_beams = self.model.config.num_beams
         num_beams = 5
-        input_ids = torch.ones((num_beams, 1), device=model.device, dtype=torch.long)
-        input_ids = input_ids * model.config.decoder_start_token_id
-        encoder_outputs = model.module.get_encoder()(
-            encoder_input_ids.repeat_interleave(num_beams, dim=0), return_dict=True
-        )
-        model_kwargs = {
-            "encoder_outputs": encoder_outputs,
-        }
-        beam_scorer = BeamSearchScorer(
-            batch_size=labels.shape[0], num_beams=num_beams, device=model.module.device
-        )
-        logits_processor = LogitsProcessorList(
-            [
-                MinLengthLogitsProcessor(5, eos_token_id=model.config.eos_token_id)
-            ]
-        )
-        beam_outputs = model.beam_search(input_ids, beam_scorer, logits_processor=logits_processor,
-                                         output_hidden_states=True, return_dict_in_generate=True, **model_kwargs)
-
-        contrastive_loss = self.calculate_contrastive_loss(num_beams, beam_outputs, labels)
-
-        # inputs = self._prepare_inputs(inputs)
-        #
-        # model_kwargs = {
-        #     "max_length": self.model.config.max_length,
-        #     "num_beams": num_beams,
-        #     "num_return_sequences": num_beams,
-        #     "output_hidden_states": True,
-        #     "return_dict_in_generate": True,
-        # }
-        # if hasattr(self.model, "encoder") and self.model.encoder.main_input_name != self.model.main_input_name:
-        #     generation_inputs = inputs[self.model.encoder.main_input_name]
-        # else:
-        #     generation_inputs = inputs[self.model.main_input_name]
-        #
-        # outputs = self.model.generate(
-        #      generation_inputs,
-        #      **model_kwargs,
-        # )
-
-        # contrastive_loss = self.calculate_contrastive_loss(num_beams, outputs, labels)
-        #print("contra_loss:", loss, 0.5*contrastive_loss)
-        return loss+0.2*contrastive_loss
-    
-    def calculate_contrastive_loss(self, num_beams, beam_outputs, labels):
-        last_hidden_state = beam_outputs['decoder_hidden_states'][-1][-1]
-        encoder_outputs = beam_outputs["encoder_hidden_states"][-1]
-        #print(encoder_outputs.shape)
-        encoder_outputs = torch.mean(encoder_outputs.repeat_interleave(num_beams, dim=0),1)
+        module_model = model.module
+        beam_outputs = module_model.generate(encoder_input_ids, output_hidden_states=True, return_dict_in_generate=True, num_return_sequences=num_beams, num_beams=num_beams) 
+        encoder_outputs = beam_outputs['encoder_hidden_states'][-1]
+        decoder_outputs = sum([val[-1] for val in beam_outputs['decoder_hidden_states']])
+        encoder_outputs = torch.mean(encoder_outputs, 1).repeat_interleave(num_beams, dim=0)
+        logits = torch.matmul(decoder_outputs, encoder_outputs.unsqueeze(-1)).squeeze(-1)
+        logits = torch.reshape(logits, (labels.shape[0], num_beams)).to(device=labels.device)
+        logits = torch.softmax(logits, dim=-1)
+        self.logits.append(logits)
+        self.sequences.append(beam_outputs['sequences'])
         labels = torch.where(labels != -100, labels, self.tokenizer.pad_token_id)
-        #print(labels.shape)
-        #print(beam_outputs["sequences"].shape)
-        candidate_labels = self.calculate_score(beam_outputs["sequences"], num_beams, labels)
+        hyps = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+        hyps = np.repeat(hyps, num_beams)
+        self.hyps.extend(hyps)
+        wandb.log({"train/beam_search_cost": (arrow.now() - start).total_seconds()}, commit=False)
+        if self.state.global_step % 1 == 0:
+            logits = torch.cat(self.logits, dim=0)
+            sequences = torch.cat(self.sequences, dim=0)
+            contrastive_loss = self.calculate_contrastive_loss(num_beams, logits, sequences, self.hyps).mean().to(loss.device)
+            self.logits = []
+            self.hyps = []
+            self.sequences = []
+            print ((arrow.now() - start).total_seconds())
+            wandb.log({"train/contrastive_loss": contrastive_loss.detach(), "train/original_loss": loss.mean().detach(), "train/loss_computing_cost": (arrow.now() - start).total_seconds()}, commit=False)
+        else:
+            contrastive_loss = 0.0
+
+        return loss+contrastive_loss
+    
+    def calculate_contrastive_loss(self, num_beams, logits, sequences, labels):
+        #print(beam_outputs["sequences"].shape, labels.shape)
+        # encoder_outputs = torch.mean(encoder_outputs.repeat_interleave(num_beams, dim=0),1)
+        candidate_labels = self.calculate_score(sequences, num_beams, labels)
         #print(labels.shape,beam_outputs["sequences"].shape)
         #print(encoder_outputs.shape)
-        logits = torch.matmul(last_hidden_state, encoder_outputs.unsqueeze(-1)).squeeze(-1)
-        logits = torch.reshape(logits, (candidate_labels.shape[0], num_beams)).to(device=candidate_labels.device)
-        contrastive_loss = nn.CrossEntropyLoss()(logits, candidate_labels)
+        contrastive_loss = nn.KLDivLoss(reduction='none')(candidate_labels, logits.to(candidate_labels.device))
+        # contrastive_loss = nn.CrossEntropyLoss(reduction='none')(logits.to(candidate_labels.device), candidate_labels)
         return contrastive_loss
 
 
-    def rerank(self, tokens, tokens_embeddings, origin_tokens, candidate_num):
+    def rerank(self, tokens, tokens_embeddings, origin_tokens, candidate_num, contra):
         overall_batch_size, max_sequence_length = tokens.shape
         batch_size = overall_batch_size // candidate_num
+        if not contra:
+            select_index = torch.arange(batch_size).to(tokens.device) * candidate_num 
+            select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
+            return select_tokens
         scores = torch.matmul(tokens_embeddings, torch.unsqueeze(origin_tokens, -1)).squeeze(-1)
         scores = torch.reshape(scores, (batch_size,candidate_num)).argmax(axis=0).long()
         select_index = torch.Tensor(scores.argmax(axis=0)).long()
-        select_index = select_index + np.arange(batch_size) * candidate_num
+        select_index = select_index + torch.arange(batch_size).to(tokens.device) * candidate_num
         select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
+        # decoded_tokens = self.tokenizer.batch_decode(tokens, skip_special_tokens=True)
         # print(select_index)
         # print(select_tokens)
         return select_tokens
 
 
     def calculate_score(self, tokens, candidate_num, origin_tokens):
-        if self.scorer is None:
-           self.scorer = RadGraph(reward_level="partial")
         overall_batch_size, max_sequence_length = tokens.shape
         batch_size = overall_batch_size // candidate_num
         
         decoded_tokens = self.tokenizer.batch_decode(tokens, skip_special_tokens=True)
-        decoded_origin_tokens = self.tokenizer.batch_decode(origin_tokens, skip_special_tokens=True)
+        decoded_tokens = [v.strip() for v in decoded_tokens]
 
-        candidates = [decoded_tokens[index::candidate_num] for index in range(candidate_num)]
-        candidates = [[v.strip() for v in val] for val in candidates]
-        #print(candidates)
-        #print(candidates, decoded_origin_tokens)
-        scores = [
-            self.scorer(candidate, decoded_origin_tokens)[1]
-            for candidate in candidates]
-        scores = np.asarray(scores)
-        select_index = torch.Tensor(scores.argmax(axis=0)).long()
+        # candidates = [decoded_tokens[index::candidate_num] for index in range(candidate_num)]
+        # candidates = [[v.strip() for v in val] for val in candidates]
+        #print(len(candidates), decoded_origin_tokens.shape())
+        scores = self.scorer(decoded_tokens, origin_tokens)[1]
+        # scores = [
+        #     partial_scorer(candidate, decoded_origin_tokens)[1]
+        #     for candidate in candidates]
+        # scores = np.asarray(scores).reshape(candidate_num, batch_size)
+        # select_index = torch.Tensor(scores.argmax(axis=0)).long()
         #select_index = select_index + np.arange(batch_size) * candidate_num
         #select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
         #print(select_index)
         #print(select_tokens)
+        return torch.softmax(torch.Tensor(np.asarray(scores).reshape(batch_size, candidate_num)), dim=-1)
         return select_index
 
     def prediction_step(
@@ -239,7 +233,6 @@ class CTTrainer(Seq2SeqTrainer):
         gen_kwargs = self._gen_kwargs.copy()
         if gen_kwargs.get("max_length") is None and gen_kwargs.get("max_new_tokens") is None:
             gen_kwargs["max_length"] = self.model.config.max_length
-        gen_kwargs["num_beams"] = 5
 #(
 #            gen_kwargs["num_beams"] if gen_kwargs.get("num_beams") is not None else self.model.config.num_beams
 #        )
@@ -252,7 +245,6 @@ class CTTrainer(Seq2SeqTrainer):
             gen_kwargs["attention_mask"] = inputs.get("attention_mask", None)
         if "global_attention_mask" in inputs:
             gen_kwargs["global_attention_mask"] = inputs.get("global_attention_mask", None)
-        gen_kwargs["num_return_sequences"] = 5
         gen_kwargs["output_hidden_states"] = True
         # prepare generation inputs
         # some encoder-decoder models can have varying encoder's and thus
@@ -263,11 +255,23 @@ class CTTrainer(Seq2SeqTrainer):
             generation_inputs = inputs[self.model.main_input_name]
 
         gen_kwargs["output_hidden_states"] = True
+        
+# outputs = self.model.generate(
+ #             generation_inputs,
+ #            return_dict_in_generate=True, 
+ #             **gen_kwargs,
+  #      )
+  #       greedy_out = self.tokenizer.batch_decode(outputs["sequences"], skip_special_tokens=True)
+        gen_kwargs["num_beams"] = 5
 
         outputs = self.model.generate(
              generation_inputs,
+             return_dict_in_generate=True, 
+             num_return_sequences=gen_kwargs["num_beams"],
              **gen_kwargs,
         )
+   #      beam_out = self.tokenizer.batch_decode(outputs["sequences"], skip_special_tokens=True)
+    #     print([val in beam_out for val in greedy_out])
 
         generated_tokens = outputs["sequences"]
 
@@ -281,12 +285,15 @@ class CTTrainer(Seq2SeqTrainer):
         ):
             generated_tokens = self._pad_tensors_to_max_len(generated_tokens, gen_kwargs["max_new_tokens"] + 1)
 
-        #encoder_input_ids = generation_inputs
-        #input_ids = torch.ones((gen_kwargs["num_return_sequences"], 1), device=model.device, dtype=torch.long)
-
+        # encoder_input_ids = generation_inputs
+        # input_ids = torch.ones((gen_kwargs["num_return_sequences"], 1), device=model.device, dtype=torch.long)
+        if_contrastive = self.state.epoch >= 0
         encoder_outputs = outputs["encoder_hidden_states"][-1]
-        encoder_outputs = torch.mean(encoder_outputs.repeat_interleave(num_beams, dim=0), 1)
-        generated_tokens = self.rerank(generated_tokens, outputs["decoder_hidden_states"][-1][-1], encoder_outputs, gen_kwargs["num_return_sequences"])
+        encoder_outputs = encoder_outputs.repeat_interleave(gen_kwargs["num_beams"], dim=0)
+        # encoder_outputs = torch.mean(encoder_outputs.repeat_interleave(num_beams, dim=0), 1)
+        encoder_outputs = torch.mean(encoder_outputs, 1)
+        generated_tokens = self.rerank(generated_tokens, sum([val[-1] for val in outputs["decoder_hidden_states"]]), encoder_outputs, gen_kwargs["num_beams"], contra=if_contrastive)
+            
 
         with torch.no_grad():
             if has_labels:
@@ -914,6 +921,7 @@ def main():
         result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
         result_bert = metric_bert.compute(predictions=decoded_preds, references=decoded_labels, lang="en")
         result_radentity = {}
+        print (len(decoded_labels), len(decoded_preds))
         result_radentity["entity_harmonic_mean"] = RadEntityMatchExact()(refs=decoded_labels, hyps=decoded_preds)[0]
         #result_radentity["nli_harmonic_mean"] = RadEntityNLI()(refs=decoded_labels, hyps=decoded_preds)[0]
         result_radentity["radgraph_simple"], result_radentity["radgraph_partial"], result_radentity["radgraph_complete"] = \
