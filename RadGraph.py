@@ -73,7 +73,7 @@ class RadGraph(nn.Module):
                 predictor=self.predictor,
                 input_file="",
                 output_file=None,
-                batch_size=1000,
+                batch_size=1,
                 print_to_console=False,
                 has_dataset_reader=True,
             )

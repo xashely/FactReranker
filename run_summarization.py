@@ -110,9 +110,8 @@ class CTTrainer(Seq2SeqTrainer):
     def compute_loss(self, model, inputs):
         labels = inputs.get("labels")
         loss, original_outputs = super().compute_loss(model, inputs, True)
-        if self.state.epoch <= 0:
+        if self.state.epoch <= 5:
             return loss
-        # return loss
         start = arrow.now()
 
         encoder_input_ids = inputs['input_ids']
@@ -120,7 +119,7 @@ class CTTrainer(Seq2SeqTrainer):
         module_model = model.module
         beam_outputs = module_model.generate(encoder_input_ids, output_hidden_states=True, return_dict_in_generate=True, num_return_sequences=num_beams, num_beams=num_beams) 
         encoder_outputs = beam_outputs['encoder_hidden_states'][-1]
-        decoder_outputs = sum([val[-1] for val in beam_outputs['decoder_hidden_states']])
+        decoder_outputs = sum([val[-1] for val in beam_outputs['decoder_hidden_states']])/len(beam_outputs['decoder_hidden_states'])
         encoder_outputs = torch.mean(encoder_outputs, 1).repeat_interleave(num_beams, dim=0)
         logits = torch.matmul(decoder_outputs, encoder_outputs.unsqueeze(-1)).squeeze(-1)
         logits = torch.reshape(logits, (labels.shape[0], num_beams)).to(device=labels.device)
@@ -268,6 +267,10 @@ class CTTrainer(Seq2SeqTrainer):
              generation_inputs,
              return_dict_in_generate=True, 
              num_return_sequences=gen_kwargs["num_beams"],
+             # num_beam_groups=gen_kwargs["num_beams"],
+             # diversity_penalty=2.0,
+             # no_repeat_ngram_size=2,
+             do_sample=True,
              **gen_kwargs,
         )
    #      beam_out = self.tokenizer.batch_decode(outputs["sequences"], skip_special_tokens=True)
@@ -921,8 +924,8 @@ def main():
         result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
         result_bert = metric_bert.compute(predictions=decoded_preds, references=decoded_labels, lang="en")
         result_radentity = {}
-        print (len(decoded_labels), len(decoded_preds))
-        result_radentity["entity_harmonic_mean"] = RadEntityMatchExact()(refs=decoded_labels, hyps=decoded_preds)[0]
+        #print (len(decoded_labels), len(decoded_preds))
+        #result_radentity["entity_harmonic_mean"] = RadEntityMatchExact()(refs=decoded_labels, hyps=decoded_preds)[0]
         #result_radentity["nli_harmonic_mean"] = RadEntityNLI()(refs=decoded_labels, hyps=decoded_preds)[0]
         result_radentity["radgraph_simple"], result_radentity["radgraph_partial"], result_radentity["radgraph_complete"] = \
             RadGraph(reward_level="full")(refs=decoded_labels, hyps=decoded_preds)[0]
@@ -931,9 +934,9 @@ def main():
         result_chexbert["chexbert_five_f1"] = chexbert_5["micro avg"]["f1-score"]
         result_chexbert["chexbert_all_f1"] = chexbert_all["micro avg"]["f1-score"]
         result_chexbert["chexbert_all_precision"] = chexbert_all["micro avg"]["precision"]
-        result_chexbert["chexbert_all_precision"] = chexbert_all["micro avg"]["precision"]
+        #result_chexbert["chexbert_all_precision"] = chexbert_all["micro avg"]["precision"]
         result_chexbert["chexbert_all_recall"] = chexbert_all["micro avg"]["recall"]
-        result_chexbert["chexbert_all_recall"] = chexbert_all["micro avg"]["recall"]
+        #result_chexbert["chexbert_all_recall"] = chexbert_all["micro avg"]["recall"]
         result = {k: round(v * 100, 4) for k, v in result.items()}
         result_bert = {"bertscore_f1":round(v, 4) for v in result_bert["f1"]}
 
