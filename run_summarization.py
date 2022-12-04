@@ -163,6 +163,7 @@ class CTTrainer(Seq2SeqTrainer):
             select_index = torch.arange(batch_size).to(tokens.device) * candidate_num 
             select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
             return select_tokens
+        #print(tokens_embeddings.shape, torch.unsqueeze(origin_tokens, -1).shape)
         scores = torch.matmul(tokens_embeddings, torch.unsqueeze(origin_tokens, -1)).squeeze(-1)
         scores = torch.reshape(scores, (batch_size,candidate_num)).argmax(axis=0).long()
         select_index = torch.Tensor(scores.argmax(axis=0)).long()
@@ -270,7 +271,6 @@ class CTTrainer(Seq2SeqTrainer):
              # num_beam_groups=gen_kwargs["num_beams"],
              # diversity_penalty=2.0,
              # no_repeat_ngram_size=2,
-             do_sample=True,
              **gen_kwargs,
         )
    #      beam_out = self.tokenizer.batch_decode(outputs["sequences"], skip_special_tokens=True)
@@ -292,10 +292,16 @@ class CTTrainer(Seq2SeqTrainer):
         # input_ids = torch.ones((gen_kwargs["num_return_sequences"], 1), device=model.device, dtype=torch.long)
         if_contrastive = self.state.epoch >= 0
         encoder_outputs = outputs["encoder_hidden_states"][-1]
-        encoder_outputs = encoder_outputs.repeat_interleave(gen_kwargs["num_beams"], dim=0)
+        #print(encoder_outputs.shape)
+        #encoder_outputs = encoder_outputs.repeat_interleave(gen_kwargs["num_beams"], dim=0)
         # encoder_outputs = torch.mean(encoder_outputs.repeat_interleave(num_beams, dim=0), 1)
-        encoder_outputs = torch.mean(encoder_outputs, 1)
-        generated_tokens = self.rerank(generated_tokens, sum([val[-1] for val in outputs["decoder_hidden_states"]]), encoder_outputs, gen_kwargs["num_beams"], contra=if_contrastive)
+        
+        encoder_outputs = torch.mean(encoder_outputs, 1).repeat_interleave(gen_kwargs["num_beams"], dim=0)
+        #print(outputs["decoder_hidden_states"][0][-1].shape)
+        #print(encoder_outputs.shape, sum([val[-1] for val in outputs["decoder_hidden_states"]]).shape)
+        gen_token_embeddings = sum([val[-1] for val in outputs["decoder_hidden_states"]]).reshape((encoder_outputs.shape[0], gen_kwargs["num_beams"], -1))
+        gen_token_embeddings = torch.mean(gen_token_embeddings,1).unsqueeze(1)
+        generated_tokens = self.rerank(generated_tokens, gen_token_embeddings, encoder_outputs, gen_kwargs["num_beams"], contra=if_contrastive)
             
 
         with torch.no_grad():
