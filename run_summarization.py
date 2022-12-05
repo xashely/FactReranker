@@ -117,7 +117,7 @@ class CTTrainer(Seq2SeqTrainer):
         encoder_input_ids = inputs['input_ids']
         num_beams = 5
         module_model = model.module
-        beam_outputs = module_model.generate(encoder_input_ids, output_hidden_states=True, return_dict_in_generate=True, num_return_sequences=num_beams, num_beams=num_beams)
+        beam_outputs = module_model.generate(encoder_input_ids, output_hidden_states=True, output_attentions=True, return_dict_in_generate=True, num_return_sequences=num_beams, num_beams=num_beams)
         decoder_attentions = sum([val[-1] for val in beam_outputs['decoder_attentions']])\
                              /len(beam_outputs['decoder_attentions'])
         decoder_attentions = decoder_attentions.mean(1)
@@ -169,6 +169,7 @@ class CTTrainer(Seq2SeqTrainer):
             select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
             return select_tokens
         #print(tokens_embeddings.shape, torch.unsqueeze(origin_tokens, -1).shape)
+        print([val[-1].shape for val in outputs['decoder_attentions']])
         decoder_attentions = sum([val[-1] for val in outputs['decoder_attentions']]) / len(outputs['decoder_attentions'])
         decoder_attentions = decoder_attentions.mean(1)
         _, generated_length, sequence_length = decoder_attentions.shape
@@ -278,6 +279,7 @@ class CTTrainer(Seq2SeqTrainer):
         outputs = self.model.generate(
              generation_inputs,
              return_dict_in_generate=True, 
+             output_attentions=True,
              num_return_sequences=gen_kwargs["num_beams"],
              # num_beam_groups=gen_kwargs["num_beams"],
              # diversity_penalty=2.0,
@@ -307,7 +309,7 @@ class CTTrainer(Seq2SeqTrainer):
         # encoder_outputs = torch.mean(encoder_outputs.repeat_interleave(num_beams, dim=0), 1)
         #print(outputs["decoder_hidden_states"][0][-1].shape)
         #print(encoder_outputs.shape, sum([val[-1] for val in outputs["decoder_hidden_states"]]).shape)
-        generated_tokens = self.rerank(outputs, contra=if_contrastive)
+        generated_tokens = self.rerank(generated_tokens,outputs,gen_kwargs["num_beams"],contra=if_contrastive)
             
 
         with torch.no_grad():
