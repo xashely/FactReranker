@@ -118,16 +118,18 @@ class CTTrainer(Seq2SeqTrainer):
         num_beams = 5
         module_model = model.module
         beam_outputs = module_model.generate(encoder_input_ids, output_hidden_states=True, output_attentions=True, return_dict_in_generate=True, num_return_sequences=num_beams, num_beams=num_beams)
-        decoder_attentions = sum([val[-1] for val in beam_outputs['decoder_attentions']])\
-                             /len(beam_outputs['decoder_attentions'])
-        decoder_attentions = decoder_attentions.mean(1)
-        _, generated_length, sequence_length = decoder_attentions.shape
+        #decoder_attentions = sum([val[-1] for val in beam_outputs['decoder_attentions']])\
+        #                     /len(beam_outputs['decoder_attentions'])
+        #decoder_attentions = decoder_attentions.mean(1)
+        #_, generated_length, sequence_length = decoder_attentions.shape
         batch_size = encoder_input_ids.shape[0]
-        decoder_attentions = decoder_attentions.reshape((batch_size, num_beams, generated_length, sequence_length))
-        logits_max = decoder_attentions.max(-1).max(-1)
-        logits_min = decoder_attentions.minimum(-1).minimum(-1)
-        logits_mean = decoder_attentions.mean(-1).mean(-1)
-        logits = 0.25*logits_max + 0.5*logits_mean + 0.25*logits_min
+        logits_max = sum([val[-1].max(-1).max(-1) for val in beam_outputs['decoder_attentions']]) / len(
+            beam_outputs['decoder_attentions'])
+        logits_min = sum([val[-1].minimum(-1).minimum(-1) for val in beam_outputs['decoder_attentions']]) / len(
+            beam_outputs['decoder_attentions'])
+        logits_mean = sum([val[-1].mean(-1).mean(-1) for val in beam_outputs['decoder_attentions']]) / len(
+            beam_outputs['decoder_attentions'])
+        logits = (0.25*logits_max + 0.5*logits_mean + 0.25*logits_min).mean(-1).reshape(batch_size,num_beams)
         logits = torch.softmax(logits.to(device=labels.device), dim=-1)
         self.logits.append(logits)
         self.sequences.append(beam_outputs['sequences'])
@@ -169,16 +171,18 @@ class CTTrainer(Seq2SeqTrainer):
             select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
             return select_tokens
         #print(tokens_embeddings.shape, torch.unsqueeze(origin_tokens, -1).shape)
-        print([val[-1].shape for val in outputs['decoder_attentions']])
-        decoder_attentions = sum([val[-1] for val in outputs['decoder_attentions']]) / len(outputs['decoder_attentions'])
-        decoder_attentions = decoder_attentions.mean(1)
-        _, generated_length, sequence_length = decoder_attentions.shape
-        decoder_attentions = decoder_attentions.reshape((batch_size, candidate_num, generated_length, sequence_length))
-        logits_max = decoder_attentions.max(-1).max(-1)
-        logits_min = decoder_attentions.minimum(-1).minimum(-1)
-        logits_mean = decoder_attentions.mean(-1).mean(-1)
+        logits_max = sum([val[-1].max(-1).max(-1) for val in outputs['decoder_attentions']])/len(outputs['decoder_attentions'])
+        logits_min = sum([val[-1].minimum(-1).minimum(-1) for val in outputs['decoder_attentions']]) / len(
+            outputs['decoder_attentions'])
+        logits_mean = sum([val[-1].mean(-1).mean(-1) for val in outputs['decoder_attentions']]) / len(
+            outputs['decoder_attentions'])
+        #decoder_attentions = sum([val[-1] for val in outputs['decoder_attentions']]) / len(outputs['decoder_attentions'])
+        #decoder_attentions = decoder_attentions.mean(1)
+        logits_max = logits_max.mean(-1)
+        logits_min = logits_min.mean(-1)
+        logits_mean = logits_mean.mean(-1)
         logits = 0.25 * logits_max + 0.5 * logits_mean + 0.25 * logits_min
-        scores = logits.argmax(axis=0).long()
+        scores = logits.reshape(batch_size,candidate_num).argmax(axis=0).long()
         select_index = torch.Tensor(scores.argmax(axis=0)).long()
         select_index = select_index + torch.arange(batch_size).to(tokens.device) * candidate_num
         select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
