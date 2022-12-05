@@ -1,0 +1,4 @@
+*.json
+wandb/
+__pycache__/
+generate.sh
