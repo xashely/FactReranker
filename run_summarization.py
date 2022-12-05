@@ -117,13 +117,18 @@ class CTTrainer(Seq2SeqTrainer):
         encoder_input_ids = inputs['input_ids']
         num_beams = 5
         module_model = model.module
-        beam_outputs = module_model.generate(encoder_input_ids, output_hidden_states=True, return_dict_in_generate=True, num_return_sequences=num_beams, num_beams=num_beams) 
-        encoder_outputs = beam_outputs['encoder_hidden_states'][-1]
-        decoder_outputs = sum([val[-1] for val in beam_outputs['decoder_hidden_states']])/len(beam_outputs['decoder_hidden_states'])
-        encoder_outputs = torch.mean(encoder_outputs, 1).repeat_interleave(num_beams, dim=0)
-        logits = torch.matmul(decoder_outputs, encoder_outputs.unsqueeze(-1)).squeeze(-1)
-        logits = torch.reshape(logits, (labels.shape[0], num_beams)).to(device=labels.device)
-        logits = torch.softmax(logits, dim=-1)
+        beam_outputs = module_model.generate(encoder_input_ids, output_hidden_states=True, return_dict_in_generate=True, num_return_sequences=num_beams, num_beams=num_beams)
+        decoder_attentions = sum([val[-1] for val in beam_outputs['decoder_attentions']])\
+                             /len(beam_outputs['decoder_attentions'])
+        decoder_attentions = decoder_attentions.mean(1)
+        _, generated_length, sequence_length = decoder_attentions.shape
+        batch_size = encoder_input_ids.shape[0]
+        decoder_attentions = decoder_attentions.reshape((batch_size, num_beams, generated_length, sequence_length))
+        logits_max = decoder_attentions.max(-1).max(-1)
+        logits_min = decoder_attentions.minimum(-1).minimum(-1)
+        logits_mean = decoder_attentions.mean(-1).mean(-1)
+        logits = 0.25*logits_max + 0.5*logits_mean + 0.25*logits_min
+        logits = torch.softmax(logits.to(device=labels.device), dim=-1)
         self.logits.append(logits)
         self.sequences.append(beam_outputs['sequences'])
         labels = torch.where(labels != -100, labels, self.tokenizer.pad_token_id)
@@ -156,16 +161,23 @@ class CTTrainer(Seq2SeqTrainer):
         return contrastive_loss
 
 
-    def rerank(self, tokens, tokens_embeddings, origin_tokens, candidate_num, contra):
+    def rerank(self, tokens, outputs, candidate_num, contra):
         overall_batch_size, max_sequence_length = tokens.shape
         batch_size = overall_batch_size // candidate_num
         if not contra:
-            select_index = torch.arange(batch_size).to(tokens.device) * candidate_num 
+            select_index = torch.arange(batch_size).to(tokens.device) * candidate_num
             select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
             return select_tokens
         #print(tokens_embeddings.shape, torch.unsqueeze(origin_tokens, -1).shape)
-        scores = torch.matmul(tokens_embeddings, torch.unsqueeze(origin_tokens, -1)).squeeze(-1)
-        scores = torch.reshape(scores, (batch_size,candidate_num)).argmax(axis=0).long()
+        decoder_attentions = sum([val[-1] for val in outputs['decoder_attentions']]) / len(outputs['decoder_attentions'])
+        decoder_attentions = decoder_attentions.mean(1)
+        _, generated_length, sequence_length = decoder_attentions.shape
+        decoder_attentions = decoder_attentions.reshape((batch_size, candidate_num, generated_length, sequence_length))
+        logits_max = decoder_attentions.max(-1).max(-1)
+        logits_min = decoder_attentions.minimum(-1).minimum(-1)
+        logits_mean = decoder_attentions.mean(-1).mean(-1)
+        logits = 0.25 * logits_max + 0.5 * logits_mean + 0.25 * logits_min
+        scores = logits.argmax(axis=0).long()
         select_index = torch.Tensor(scores.argmax(axis=0)).long()
         select_index = select_index + torch.arange(batch_size).to(tokens.device) * candidate_num
         select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
@@ -196,7 +208,6 @@ class CTTrainer(Seq2SeqTrainer):
         #print(select_index)
         #print(select_tokens)
         return torch.softmax(torch.Tensor(np.asarray(scores).reshape(batch_size, candidate_num)), dim=-1)
-        return select_index
 
     def prediction_step(
             self,
@@ -291,17 +302,12 @@ class CTTrainer(Seq2SeqTrainer):
         # encoder_input_ids = generation_inputs
         # input_ids = torch.ones((gen_kwargs["num_return_sequences"], 1), device=model.device, dtype=torch.long)
         if_contrastive = self.state.epoch >= 0
-        encoder_outputs = outputs["encoder_hidden_states"][-1]
         #print(encoder_outputs.shape)
         #encoder_outputs = encoder_outputs.repeat_interleave(gen_kwargs["num_beams"], dim=0)
         # encoder_outputs = torch.mean(encoder_outputs.repeat_interleave(num_beams, dim=0), 1)
-        
-        encoder_outputs = torch.mean(encoder_outputs, 1).repeat_interleave(gen_kwargs["num_beams"], dim=0)
         #print(outputs["decoder_hidden_states"][0][-1].shape)
         #print(encoder_outputs.shape, sum([val[-1] for val in outputs["decoder_hidden_states"]]).shape)
-        gen_token_embeddings = sum([val[-1] for val in outputs["decoder_hidden_states"]]).reshape((encoder_outputs.shape[0], gen_kwargs["num_beams"], -1))
-        gen_token_embeddings = torch.mean(gen_token_embeddings,1).unsqueeze(1)
-        generated_tokens = self.rerank(generated_tokens, gen_token_embeddings, encoder_outputs, gen_kwargs["num_beams"], contra=if_contrastive)
+        generated_tokens = self.rerank(outputs, contra=if_contrastive)
             
 
         with torch.no_grad():
