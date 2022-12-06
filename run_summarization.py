@@ -110,8 +110,8 @@ class CTTrainer(Seq2SeqTrainer):
     def compute_loss(self, model, inputs):
         labels = inputs.get("labels")
         loss, original_outputs = super().compute_loss(model, inputs, True)
-        if self.state.epoch <= 5:
-            return loss
+        #if self.state.epoch <= 5:
+        #    return loss
         start = arrow.now()
 
         encoder_input_ids = inputs['input_ids']
@@ -123,9 +123,9 @@ class CTTrainer(Seq2SeqTrainer):
         #decoder_attentions = decoder_attentions.mean(1)
         #_, generated_length, sequence_length = decoder_attentions.shape
         batch_size = encoder_input_ids.shape[0]
-        logits_max = sum([val[-1].max(-1).max(-1) for val in beam_outputs['decoder_attentions']]) / len(
+        logits_max = sum([val[-1].max(-1)[0].max(-1)[0] for val in beam_outputs['decoder_attentions']]) / len(
             beam_outputs['decoder_attentions'])
-        logits_min = sum([val[-1].minimum(-1).minimum(-1) for val in beam_outputs['decoder_attentions']]) / len(
+        logits_min = sum([val[-1].min(-1)[0].min(-1)[0] for val in beam_outputs['decoder_attentions']]) / len(
             beam_outputs['decoder_attentions'])
         logits_mean = sum([val[-1].mean(-1).mean(-1) for val in beam_outputs['decoder_attentions']]) / len(
             beam_outputs['decoder_attentions'])
@@ -145,7 +145,7 @@ class CTTrainer(Seq2SeqTrainer):
             self.logits = []
             self.hyps = []
             self.sequences = []
-            print ((arrow.now() - start).total_seconds())
+            #print ((arrow.now() - start).total_seconds())
             wandb.log({"train/contrastive_loss": contrastive_loss.detach(), "train/original_loss": loss.mean().detach(), "train/loss_computing_cost": (arrow.now() - start).total_seconds()}, commit=False)
         else:
             contrastive_loss = 0.0
@@ -171,8 +171,9 @@ class CTTrainer(Seq2SeqTrainer):
             select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
             return select_tokens
         #print(tokens_embeddings.shape, torch.unsqueeze(origin_tokens, -1).shape)
-        logits_max = sum([val[-1].max(-1).max(-1) for val in outputs['decoder_attentions']])/len(outputs['decoder_attentions'])
-        logits_min = sum([val[-1].minimum(-1).minimum(-1) for val in outputs['decoder_attentions']]) / len(
+        #print([val[-1].max(-1) for val in outputs['decoder_attentions']])
+        logits_max = sum([val[-1].max(-1)[0].max(-1)[0] for val in outputs['decoder_attentions']])/len(outputs['decoder_attentions'])
+        logits_min = sum([val[-1].min(-1)[0].min(-1)[0] for val in outputs['decoder_attentions']]) / len(
             outputs['decoder_attentions'])
         logits_mean = sum([val[-1].mean(-1).mean(-1) for val in outputs['decoder_attentions']]) / len(
             outputs['decoder_attentions'])
@@ -308,7 +309,7 @@ class CTTrainer(Seq2SeqTrainer):
         # encoder_input_ids = generation_inputs
         # input_ids = torch.ones((gen_kwargs["num_return_sequences"], 1), device=model.device, dtype=torch.long)
         if_contrastive = self.state.epoch >= 0
-        #print(encoder_outputs.shape)
+        #p --finetune --load_from pttm_epoch200_100topics.pirint(encoder_outputs.shape)
         #encoder_outputs = encoder_outputs.repeat_interleave(gen_kwargs["num_beams"], dim=0)
         # encoder_outputs = torch.mean(encoder_outputs.repeat_interleave(num_beams, dim=0), 1)
         #print(outputs["decoder_hidden_states"][0][-1].shape)

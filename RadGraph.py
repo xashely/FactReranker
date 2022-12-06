@@ -114,7 +114,7 @@ class RadGraph(nn.Module):
                           for i, reference_report in enumerate(refs)
                           if i not in empty_report_index_list and i not in cached_refs_index_list
                       ]
-        print (f"Cache hit ratio {len(report_list) / (len(hyps) + len(refs))}")
+        #print (f"Cache hit ratio {len(report_list) / (len(hyps) + len(refs))}")
 
         # assert len(report_list) == 2 * number_of_non_empty_reports
 
