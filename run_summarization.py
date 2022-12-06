@@ -23,6 +23,7 @@ import arrow
 import logging
 import os
 import sys
+import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 from copy import deepcopy
@@ -158,6 +159,7 @@ class CTTrainer(Seq2SeqTrainer):
         candidate_labels = self.calculate_score(sequences, num_beams, labels)
         #print(labels.shape,beam_outputs["sequences"].shape)
         #print(encoder_outputs.shape)
+        candidate_labels = F.log_softmax(candidate_labels, dim=1)
         contrastive_loss = nn.KLDivLoss(reduction='none')(candidate_labels, logits.to(candidate_labels.device))
         # contrastive_loss = nn.CrossEntropyLoss(reduction='none')(logits.to(candidate_labels.device), candidate_labels)
         return contrastive_loss
