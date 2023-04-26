@@ -4,10 +4,13 @@ import numpy as np
 import sys
 import logging
 import json
+import re
+import traceback
 
 from vilmedic.constants import EXTRA_CACHE_DIR
 from vilmedic.zoo.utils import download_model
 from vilmedic.blocks.scorers.RadGraph.utils import (
+    get_entity,
     preprocess_reports,
     postprocess_reports,
     compute_reward,
@@ -25,6 +28,114 @@ from allennlp.common.util import import_module_and_submodules
 from allennlp.predictors.predictor import Predictor
 from allennlp.models.archival import load_archive
 from allennlp.common.checks import check_for_gpu
+
+
+def preprocess_reports(report_list):
+    """Load up the files mentioned in the temporary json file, and
+    processes them in format that the dygie model can take as input.
+    Also save the processed file in a temporary file.
+    """
+    final_list = []
+    for idx, report in enumerate(report_list):
+        sen = re.sub(
+            "(?<! )(?=[/,-,:,.,!?()])|(?<=[/,-,:,.,!?()])(?! )", r" ", report
+        ).split()
+        temp_dict = {}
+
+        temp_dict["doc_key"] = str(idx)
+
+        ## Current way of inference takes in the whole report as 1 sentence
+        temp_dict["sentences"] = [sen]
+
+        final_list.append(temp_dict)
+
+    final_lengths = [len(val["sentences"][0]) for val in final_list]
+    doc_lengths = [len(val["sentences"]) for val in final_list]
+    final_list = [v for val in final_list for v in val["sentences"]]
+    batch_size = 10
+    final_lists = []
+    for start_index in range(0, len(final_list), batch_size):
+        final_lists.append({"doc_key": str(start_index), "sentences": final_list[start_index:start_index+batch_size]}) 
+    # final_list = [{"doc_key": "0", "sentences": final_list}]
+
+    return [json.dumps(item) for item in final_lists], final_lengths
+
+
+def postprocess_reports(results, lengths):
+    """Post processes all the reports and saves the result in train.json format"""
+    final_dict = {}
+    data = []
+    # overall_data = {"sentences": [], "predicted_ner": [], "predicted_relations": []}
+    doc_index = 0
+    sen_index = 0
+    cum_length = 0
+
+    for r in results:
+        datum = json.loads(r)
+        for sentence, predicted_ner, predicted_relation in zip(
+            datum["sentences"],
+            datum["predicted_ner"],
+            datum["predicted_relations"],
+        ):
+            data.append({"sentences": [sentence], "predicted_ner": [predicted_ner], "predicted_relations": [predicted_relation], "doc_key": str(doc_index)})
+            doc_index += 1
+        # data.append(json.loads(r))
+        # overall_data["sentences"].extend(data[-1]["sentences"])
+        # overall_data["predicted_ner"].extend(data[-1]["predicted_ner"])
+        # overall_data["predicted_relations"].extend(data[-1]["predicted_relations"])
+
+    # data = [overall_data]
+    pre_length = 0
+
+    for file, length in zip(data, lengths):
+        if int(file["doc_key"]) % 10 == 0:
+            pre_length = 0
+        doc_dict = postprocess_individual_report(file, lengths=pre_length)
+        pre_length += length
+        final_dict[file["doc_key"]] = doc_dict
+
+    return final_dict
+
+
+def postprocess_individual_report(file, data_source=None, lengths=None):
+    """Postprocesses individual report
+    Args:
+        file: output dict for individual reports
+        final_dict: Dict for storing all the reports
+    """
+    temp_dict = {}
+    temp_dict["text"] = " ".join(file["sentences"][0])
+    n = file["predicted_ner"][0]
+    n = [[val[0] - lengths, val[1] - lengths, val[2], val[3], val[4]] for val in n]
+    r = file["predicted_relations"][0]
+    r = [[val[0] - lengths, val[1] - lengths, val[2] - lengths, val[3] - lengths, val[4], val[5], val[6]] for val in r]
+    s = file["sentences"][0]
+    temp_dict["entities"] = get_entity(n, r, s)
+    temp_dict["data_source"] = data_source
+    temp_dict["data_split"] = "inference"
+
+    # final_dict[file["doc_key"]] = temp_dict
+    return temp_dict
+
+    pre_length = 0
+    if "predicted_ner" not in file:
+        print([len(val) for val in file["sentences"]])
+    for index, (sentence, n, r, l) in enumerate(zip(file["sentences"], file["predicted_ner"], file["predicted_relations"], lengths)):
+        try:
+            temp_dict = {}
+
+            temp_dict["text"] = " ".join(sentence)
+            # n = [[val[0] - pre_length, val[1] - pre_length, val[2], val[3], val[4]] for val in n]
+            # pre_length += l
+            temp_dict["entities"] = get_entity(n, r, sentence)
+            temp_dict["data_source"] = data_source
+            temp_dict["data_split"] = "inference"
+
+            final_dict[str(index)] = temp_dict
+
+        except Exception:
+            traceback.print_exc()
+            print(f"Error in doc key: {file['doc_key']}. Skipping inference on this file")
 
 
 class RadGraph(nn.Module):
@@ -78,10 +189,11 @@ class RadGraph(nn.Module):
                 has_dataset_reader=True,
             )
 
-        with open("/scratch/ace14856qn/cache.json") as f:
-            self.cache = json.loads(f.readlines()[0])
+        # with open("/scratch/ace14856qn/cache.json") as f:
+        #     self.cache = json.loads(f.readlines()[0])
+        self.cache = {}
 
-    def forward(self, refs, hyps):
+    def forward(self, refs, hyps, fill_cache=True):
         # Preprocessing
         number_of_reports = len(hyps)
 
@@ -114,7 +226,8 @@ class RadGraph(nn.Module):
                           for i, reference_report in enumerate(refs)
                           if i not in empty_report_index_list and i not in cached_refs_index_list
                       ]
-        #print (f"Cache hit ratio {len(report_list) / (len(hyps) + len(refs))}")
+        print (len(hyps), len(refs))
+        # print (f"Cache hit ratio {len(report_list) / (len(hyps) + len(refs))}")
 
         # assert len(report_list) == 2 * number_of_non_empty_reports
 
@@ -123,13 +236,19 @@ class RadGraph(nn.Module):
         #     inference_dict = pickle.load(open("./temp", "rb"))
         # else:
         if report_list:
-            model_input = preprocess_reports(report_list)
-            self.manager._input_file = str(model_input)
-            results = self.manager.run()
+            model_input, lengths = preprocess_reports(report_list)
+            all_results = []
+            batch_size = 10
+            for start_index in range(0, len(model_input), batch_size):
+                self.manager._input_file = str(model_input[start_index:start_index+batch_size])
+                results = self.manager.run()
+                all_results.extend(results)
+            results = all_results
 
         # Postprocessing
-            inference_dict = postprocess_reports(results)
+            inference_dict = postprocess_reports(results, lengths)
         # pickle.dump(inference_dict, open("./temp", "wb"))
+        # print (len(inference_dict.keys()))
 
         # Compute reward
         reward_list = []
@@ -175,8 +294,9 @@ class RadGraph(nn.Module):
             non_empty_report_index += 1
 
         assert non_empty_report_index == number_of_non_empty_reports
-        with open("/scratch/ace14856qn/cache.json", "w") as f:
-            f.write(json.dumps(self.cache))
+        if fill_cache:
+            with open("/scratch/ace14856qn/cache.json", "w") as f:
+                f.write(json.dumps(self.cache))
 
         if self.reward_level == "full":
             reward_list_ = ([r[0] for r in reward_list], [r[1] for r in reward_list], [r[2] for r in reward_list])
@@ -184,6 +304,8 @@ class RadGraph(nn.Module):
             mean_reward = (np.mean(reward_list[0]), np.mean(reward_list[1]), np.mean(reward_list[2]))
         else:
             mean_reward = np.mean(reward_list)
+
+        # print (reward_list)
 
         return (
             mean_reward,
