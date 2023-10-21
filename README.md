@@ -1,5 +1,5 @@
-# The repository is the implementation for the paper Factreranker: Fact-guided reranker for faithful radiology report summarization
-##Todo
+# Implementation for Factreranker
+## Todo
 Add detail description for running the code
 ## Citation
 
