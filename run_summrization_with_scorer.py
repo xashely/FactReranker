@@ -113,7 +113,7 @@ class CTTrainer(Seq2SeqTrainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         labels = inputs.get("labels")
         loss, original_outputs = super().compute_loss(model, inputs, True)
-        if self.state.epoch <= 0:
+        if self.state.epoch <= 2000:
             if return_outputs:
                 return loss, original_outputs
             else:
@@ -149,18 +149,6 @@ class CTTrainer(Seq2SeqTrainer):
         hyps = np.repeat(hyps, num_beams)
         self.hyps.extend(hyps)
         wandb.log({"train/beam_search_cost": (arrow.now() - start).total_seconds()}, commit=False)
-        if self.state.global_step % 10 == 9:
-            logits = torch.cat(self.logits, dim=0)
-            sequences = torch.cat(self.sequences, dim=0)
-            original_sequences = torch.cat(self.original_sequences, dim=0)
-            contrastive_loss = self.calculate_contrastive_loss(num_beams, logits, sequences, self.hyps, original_sequences).mean().to(loss.device)
-            self.logits = []
-            self.hyps = []
-            self.sequences = []
-            self.original_sequences = []
-            #print ((arrow.now() - start).total_seconds())
-            wandb.log({"train/contrastive_loss": contrastive_loss.detach(), "train/original_loss": loss.mean().detach(), "train/loss_computing_cost": (arrow.now() - start).total_seconds()}, commit=False)
-
         if return_outputs:
             # return contrastive_loss, original_outputs
             return loss, original_outputs
@@ -181,31 +169,17 @@ class CTTrainer(Seq2SeqTrainer):
         return contrastive_loss
 
 
-    def rerank(self, tokens, outputs, candidate_num, contra):
+    def rerank(self, tokens, original_tokens, candidate_num, contra):
         overall_batch_size, max_sequence_length = tokens.shape
         batch_size = overall_batch_size // candidate_num
+        print (tokens.shape, original_tokens.shape, candidate_num)
         if not contra:
             select_index = torch.arange(batch_size).to(tokens.device) * candidate_num
             select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
             return select_tokens
-        #print(tokens_embeddings.shape, torch.unsqueeze(origin_tokens, -1).shape)
-        #print([val[-1].max(-1) for val in outputs['decoder_attentions']])
-        logits_max = sum([val[-1].max(-1)[0].max(-1)[0] for val in outputs['decoder_attentions']])/len(outputs['decoder_attentions'])
-        logits_min = sum([val[-1].min(-1)[0].min(-1)[0] for val in outputs['decoder_attentions']]) / len(
-            outputs['decoder_attentions'])
-        logits_mean = sum([val[-1].mean(-1).mean(-1) for val in outputs['decoder_attentions']]) / len(
-            outputs['decoder_attentions'])
-        #decoder_attentions = sum([val[-1] for val in outputs['decoder_attentions']]) / len(outputs['decoder_attentions'])
-        #decoder_attentions = decoder_attentions.mean(1)
-        logits_max = logits_max.mean(-1)
-        logits_min = logits_min.mean(-1)
-        logits_mean = logits_mean.mean(-1)
-        logits = logits_max + logits_mean + logits_min
-        scores = logits.reshape(batch_size,candidate_num).argmax(axis=0).long()
-        select_index = torch.Tensor(scores.argmax(axis=0)).long()
+        # decoded_tokens = self.tokenizer.batch_decode(tokens, skip_special_tokens=True)
         select_index = select_index + torch.arange(batch_size).to(tokens.device) * candidate_num
         select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
-        # decoded_tokens = self.tokenizer.batch_decode(tokens, skip_special_tokens=True)
         # print(select_index)
         # print(select_tokens)
         return select_tokens
@@ -345,7 +319,7 @@ class CTTrainer(Seq2SeqTrainer):
         # encoder_outputs = torch.mean(encoder_outputs.repeat_interleave(num_beams, dim=0), 1)
         #print(outputs["decoder_hidden_states"][0][-1].shape)
         #print(encoder_outputs.shape, sum([val[-1] for val in outputs["decoder_hidden_states"]]).shape)
-        generated_tokens = self.rerank(generated_tokens,outputs,gen_kwargs["num_beams"],contra=if_contrastive)
+        generated_tokens = self.rerank(generated_tokens,generation_inputs,gen_kwargs["num_beams"],contra=if_contrastive)
             
 
         with torch.no_grad():

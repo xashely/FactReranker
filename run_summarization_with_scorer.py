@@ -17,13 +17,17 @@
 Fine-tuning the library models for sequence to sequence.
 """
 # You can also adapt this script on your own sequence to sequence task. Pointers for this are left as comments.
-
+from torch.nn.functional import cosine_similarity
+from sentence_transformers import SentenceTransformer, util, CrossEncoder
+# from scorers.st_entity_scorer import EntityCrossEncoder, preprocess_dataset, default_data_collator
+from scorers.st_entity_single_scorer import preprocess_dataset, build_hyp_dicts, entity_labels, relation_labels
 import json
 import wandb
 import arrow
 import logging
 import os
 import sys
+import pandas as pd
 import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -37,6 +41,7 @@ import datasets
 import nltk  # Here to have a nice missing dependency error message early on
 import numpy as np
 from datasets import load_dataset
+from preprocess_scorer import build_dataset, from_samples_to_triple_dataset
 from transformers.deepspeed import is_deepspeed_zero3_enabled
 #from CheXbert import CheXbert
 
@@ -51,10 +56,12 @@ from torch import nn
 from filelock import FileLock
 from transformers import (
     AutoConfig,
+    AutoModelForSequenceClassification,
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
     DataCollatorForSeq2Seq,
     HfArgumentParser,
+    default_data_collator,
     MBart50Tokenizer,
     MBart50TokenizerFast,
     MBartTokenizer,
@@ -68,13 +75,14 @@ from transformers import (
     BeamSearchScorer,
 )
 from transformers.trainer_utils import get_last_checkpoint
-from transformers.utils import check_min_version, is_offline_mode, send_example_telemetry
+# from transformers.utils import check_min_version, is_offline_mode, send_example_telemetry
 from transformers.utils.versions import require_version
 
 sys.path.append(os.path.join(os.path.dirname(__file__)))
 model_path = "facebook/bart-base"
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.24.0.dev0")
+# check_min_version("4.24.0.dev0")
+RADGRAPH_LABELS = {"ANAT-DP": 0, "OBS-DP": 1, "OBS-U": 2, "OBS-DA": 3}
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/summarization/requirements.txt")
 
@@ -105,7 +113,17 @@ class TestCallback(TrainerCallback):
 
 
 class CTTrainer(Seq2SeqTrainer):
-    scorer = RadGraph(reward_level="full", cuda=torch.cuda.current_device(), batch_size=1)
+    radgraph_scorer = RadGraph(reward_level="full", batch_size=1)
+    config = AutoConfig.from_pretrained("/scratch/ace14856qn/cross_entity_scorer_openi_results")
+    scorer_tokenizer = AutoTokenizer.from_pretrained("/scratch/ace14856qn/cross_entity_scorer_openi_results")
+    scorer = AutoModelForSeq2SeqLM.from_pretrained("/scratch/ace14856qn/cross_entity_scorer_openi_results/checkpoint-150", config=config)
+    # scorer = AutoModelForSequenceClassification.from_pretrained("/scratch/ace14856qn/scorer_results")
+    # scorer_tokenizer = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
+    # scorer = EntityCrossEncoder.from_pretrained("/scratch/ace14856qn/cross_entity_scorer_results/checkpoint-2500", model_name_or_path="emilyalsentzer/Bio_ClinicalBERT").to("cuda")
+    # scorer = SentenceTransformer("/scratch/ace14856qn/entity_scorer_results/")
+    # scorer = CrossEncoder("/scratch/ace14856qn/entity_scorer_results/")
+    # metric_trec = evaluate.load("trec_eval")
+    overall_result = {"mrr": [], "num": []}
     sequences = []
     original_sequences = []
     logits = []
@@ -113,7 +131,7 @@ class CTTrainer(Seq2SeqTrainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         labels = inputs.get("labels")
         loss, original_outputs = super().compute_loss(model, inputs, True)
-        if self.state.epoch <= 0:
+        if self.state.epoch <= 2000:
             if return_outputs:
                 return loss, original_outputs
             else:
@@ -121,9 +139,9 @@ class CTTrainer(Seq2SeqTrainer):
         start = arrow.now()
 
         encoder_input_ids = inputs['input_ids']
-        num_beams = 5
+        num_beams = 10
         module_model = model.module
-        beam_outputs = module_model.generate(encoder_input_ids, output_hidden_states=True, output_attentions=True, return_dict_in_generate=True, num_return_sequences=num_beams, num_beams=num_beams)
+        beam_outputs = module_model.generate(encoder_input_ids, output_hidden_states=True, output_attentions=True, return_dict_in_generate=True, num_return_sequences=num_beams, num_beams=num_beams, max_length=40)
         #decoder_attentions = sum([val[-1] for val in beam_outputs['decoder_attentions']])\
         #                     /len(beam_outputs['decoder_attentions'])
         #decoder_attentions = decoder_attentions.mean(1)
@@ -149,18 +167,6 @@ class CTTrainer(Seq2SeqTrainer):
         hyps = np.repeat(hyps, num_beams)
         self.hyps.extend(hyps)
         wandb.log({"train/beam_search_cost": (arrow.now() - start).total_seconds()}, commit=False)
-        if self.state.global_step % 10 == 9:
-            logits = torch.cat(self.logits, dim=0)
-            sequences = torch.cat(self.sequences, dim=0)
-            original_sequences = torch.cat(self.original_sequences, dim=0)
-            contrastive_loss = self.calculate_contrastive_loss(num_beams, logits, sequences, self.hyps, original_sequences).mean().to(loss.device)
-            self.logits = []
-            self.hyps = []
-            self.sequences = []
-            self.original_sequences = []
-            #print ((arrow.now() - start).total_seconds())
-            wandb.log({"train/contrastive_loss": contrastive_loss.detach(), "train/original_loss": loss.mean().detach(), "train/loss_computing_cost": (arrow.now() - start).total_seconds()}, commit=False)
-
         if return_outputs:
             # return contrastive_loss, original_outputs
             return loss, original_outputs
@@ -181,33 +187,179 @@ class CTTrainer(Seq2SeqTrainer):
         return contrastive_loss
 
 
-    def rerank(self, tokens, outputs, candidate_num, contra):
+    def rerank(self, tokens, original_tokens, labels, candidate_num, contra):
         overall_batch_size, max_sequence_length = tokens.shape
         batch_size = overall_batch_size // candidate_num
+        print (batch_size, overall_batch_size, candidate_num)
+        max_ori_length = original_tokens.shape[1]
         if not contra:
             select_index = torch.arange(batch_size).to(tokens.device) * candidate_num
             select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
             return select_tokens
-        #print(tokens_embeddings.shape, torch.unsqueeze(origin_tokens, -1).shape)
-        #print([val[-1].max(-1) for val in outputs['decoder_attentions']])
-        logits_max = sum([val[-1].max(-1)[0].max(-1)[0] for val in outputs['decoder_attentions']])/len(outputs['decoder_attentions'])
-        logits_min = sum([val[-1].min(-1)[0].min(-1)[0] for val in outputs['decoder_attentions']]) / len(
-            outputs['decoder_attentions'])
-        logits_mean = sum([val[-1].mean(-1).mean(-1) for val in outputs['decoder_attentions']]) / len(
-            outputs['decoder_attentions'])
-        #decoder_attentions = sum([val[-1] for val in outputs['decoder_attentions']]) / len(outputs['decoder_attentions'])
-        #decoder_attentions = decoder_attentions.mean(1)
-        logits_max = logits_max.mean(-1)
-        logits_min = logits_min.mean(-1)
-        logits_mean = logits_mean.mean(-1)
-        logits = logits_max + logits_mean + logits_min
-        scores = logits.reshape(batch_size,candidate_num).argmax(axis=0).long()
-        select_index = torch.Tensor(scores.argmax(axis=0)).long()
-        select_index = select_index + torch.arange(batch_size).to(tokens.device) * candidate_num
-        select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
-        # decoded_tokens = self.tokenizer.batch_decode(tokens, skip_special_tokens=True)
+        
+        decoded_tokens = self.tokenizer.batch_decode(tokens, skip_special_tokens=True)
+        decoded_original_tokens = self.tokenizer.batch_decode(torch.repeat_interleave(original_tokens, candidate_num, dim=0), skip_special_tokens=True)
+        labels = torch.where(labels != -100, labels, self.tokenizer.pad_token_id)
+        hyps = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+        batch_size = len(hyps)
+        hyps = np.repeat(hyps, candidate_num)
+        # _, true_scores, _, true_graph = self.radgraph_scorer(refs=hyps, hyps=decoded_tokens, fill_cache=False)
+        # true_scores = true_scores[1]
+        # rad_ref_tokens = [" ".join(val.split()) for val in decoded_original_tokens]
+        # rad_hyp_tokens = [" ".join(val.split()) for val in decoded_tokens]
+        # _, _, hyp_graph, ref_graph = self.radgraph_scorer(refs=rad_ref_tokens, hyps=rad_hyp_tokens, fill_cache=False)
+        # _, true_scores, _, _ = true_scores
+        # true_scores = np.array(true_scores[1][1]).reshape(batch_size,candidate_num)
+        # rad_ref_tokens = [val[:230]
+        # _, true_scores, _, _ = true_scores
+        # true_scores = np.array(true_scores[1]).reshape(batch_size,candidate_num)
+        # one_hot = (true_scores == true_scores.max(axis=1)[:,None]).astype(int)
+        # qrel = [
+        #     {
+        #         "query": np.repeat(list(range(batch_size)), candidate_num),
+        #         "q0": ["q0"] * (batch_size * candidate_num),
+        #         "docid": [str(val) for val in list(range(batch_size * candidate_num))],
+        #         "rel": one_hot.reshape(-1),
+        #     }
+        # ]
+        print ("Extract graph via RadGraph")
+
+        # decoded_tokens = self.scorer_tokenizer(decoded_tokens, decoded_original_tokens, padding="max_length", truncation=True, max_length=max_ori_length, return_tensors="pt")
+        # tokens = {key: val.to(torch.cuda.current_device()) for key, val in tokens.items()}
+        # te = self.scorer.encode(decoded_tokens, convert_to_tensor=True)
+        # ote = self.scorer.encode(decoded_original_tokens, convert_to_tensor=True)
+        # scores = self.scorer.predict(list(zip(decoded_tokens, decoded_original_tokens)))
+        # with open("/scratch/ace14856qn/hyp_ref.json") as f:
+            # hyp_ref = json.loads(f.readlines()[0])
+        # ref_graph = [pd.DataFrame.from_records(list(val["entities"].values())) for val in ref_graph]
+        # true_graph = [pd.DataFrame.from_records(list(val["entities"].values())) for val in true_graph]
+        # hyp_graph = [pd.DataFrame.from_records(list(val["entities"].values())) for val in hyp_graph]
+        hyp_ref = {
+           "query": [],
+           "ref_graph_tokens": [],
+           "ref_graph_labels": [],
+           "ref_graph_relations": [],
+           "true_graph_tokens": [],
+           "true_graph_labels": [],
+           "true_graph_relations": [],
+           "hyp": [],
+           "score": [],
+           "positive": [],
+           "hyp_graph_tokens": [],
+           "hyp_graph_labels": [],
+           "hyp_graph_relations": [],
+        }
+        # hyp_ref = []
+        # hyp_ref = sorted(list(zip(decoded_tokens, decoded_original_tokens, hyps)))
+        hyp_ref = list(zip(decoded_tokens, decoded_original_tokens, hyps))
+        # with open("/scratch/ace14856qn/openi_train_hyp_ref.json", "a") as f:
+        #     f.write(json.dumps(hyp_ref))
+        #     f.write('\n')
+        # select_index = torch.arange(batch_size).to(tokens.device) * candidate_num
+        # select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
+        # return select_tokens
+            # hyp_ref["ref_graph_labels"].append([RADGRAPH_LABELS[label] for label in ref_graph[start_index]["label"]] if "tokens" in ref_graph[start_index].columns else [])
+            # hyp_ref["ref_graph_relations"].append([int(not label) for label in ref_graph[start_index]["relations"]] if "tokens" in ref_graph[start_index].columns else [])
+            # hyp_ref["true_graph_tokens"].append(true_graph[start_index]["tokens"] if "tokens" in true_graph[start_index].columns else [])
+            # hyp_ref["true_graph_labels"].append([RADGRAPH_LABELS[label] for label in true_graph[start_index]["label"]] if "tokens" in true_graph[start_index].columns else [])
+            # hyp_ref["true_graph_relations"].append([int(not label) for label in true_graph[start_index]["relations"]] if "tokens" in true_graph[start_index].columns else [])
+            # hyp_ref["hyp"].append(decoded_tokens[start_index:start_index+10])
+            # hyp_ref["score"].append(true_scores[int(start_index / 10)])
+            # positive_index = [val == max(hyp_ref["score"][-1]) for val in hyp_ref["score"][-1]] 
+            # hyp_ref["positive"].append(np.array(decoded_tokens[start_index:start_index+10]))
+            # hyp_ref["hyp_graph_tokens"].append([val["tokens"] if "tokens" in val.columns else [] for val in hyp_graph[start_index:start_index+10]])
+            # hyp_ref["hyp_graph_labels"].append([[RADGRAPH_LABELS[v] for v in val["label"]] if "label" in val.columns else [] for val in hyp_graph[start_index:start_index+10]])
+            # hyp_ref["hyp_graph_relations"].append([[int(not v) for v in val["relations"]] if "relations" in val.columns else [] for val in hyp_graph[start_index:start_index+10]])
+        # hyp_ref = preprocess_dataset(self.scorer_tokenizer, hyp_ref)
+        hyp_ref = build_dataset(hyp_ref)
+        entity_label_dict = dict(zip(entity_labels, range(len(entity_labels))))
+        relation_label_dict = dict(zip(relation_labels, range(len(relation_labels))))
+        hyp_dicts = build_hyp_dicts(hyp_ref)
+        class FakeArgs:
+            max_target_length = 360
+            pad_to_max_length = False
+            max_source_length = 360
+            ignore_pad_token_for_loss = True
+        data_args = FakeArgs()
+        hyp_ref_raw = hyp_ref
+        hyp_ref = hyp_ref.map(lambda x:preprocess_dataset(x, tokenizer=self.scorer_tokenizer, data_args=data_args), batched=True,
+                remove_columns=hyp_ref.column_names)
+        inputs = default_data_collator(hyp_ref)
+        # inputs = {key: val.to("cuda") for key, val in inputs.items()}
+        preds = self.scorer(**inputs)
+        def clean_prediction(prediction):
+            prediction = prediction.split("</s>")[0].split("<s>")[1]
+            prediction = prediction.split(" [ENT] ")
+            prediction = [val.split() for val in prediction]
+            new_prediction = []
+            for val in prediction:
+                if len(val) != 3:
+                    continue
+                new_prediction.append((val[0], entity_label_dict.get(val[1], 4), relation_label_dict.get(val[2], 2)))
+            return new_prediction
+        preds = torch.argmax(preds.logits, dim=-1)
+        predictions = self.scorer_tokenizer.batch_decode(preds)
+        predictions = [clean_prediction(val) for val in predictions]
+        print (predictions[0], hyp_ref_raw[0])
+        scores = []
+        for hyp_dict, prediction in zip(hyp_dicts, predictions):
+            scores.append([])
+            for hyp in hyp_dict:
+                hyp = set(hyp)
+                prediction = set(prediction)
+                if len(hyp) + len(prediction) == 0:
+                    score = 0.0
+                else:
+                    score = len(hyp & prediction) /( len(hyp) + len(prediction))
+                scores[-1].append(score)
+         
+        scores = np.array(scores)
+        # scores = [
+        # scores = cosine_similarity(te, ote)
+        # scores = self.scorer(**decoded_tokens)['logits']
+        print ("Score calculation finished")
+
+        run = [
+            {
+                "query": np.repeat(list(range(batch_size)), candidate_num),
+                "q0": ["q0"] * (batch_size * candidate_num),
+                "docid": [str(val) for val in list(range(batch_size * candidate_num))],
+                # "rank": scores.argsort(axis=-1).argsort(axis=-1).reshape(-1),
+                "rank": candidate_num - np.array(list(range(candidate_num)) * batch_size) - 1, 
+                # # "score": scores.reshape(-1), 
+                "score": candidate_num - np.array(list(range(candidate_num)) * batch_size),
+                "system": ["test"] * (batch_size * candidate_num),
+            }
+        ]
+        print (scores.shape, batch_size, candidate_num)
+        scores = scores.reshape(batch_size, candidate_num)
+        # scores = scores.reshape(batch_size,candidate_num)
+
+
+        select_index = torch.Tensor(scores.argmax(axis=1)).long()
+        select_tokens = tokens.reshape(batch_size, candidate_num, -1)[torch.arange(batch_size), select_index]
+        # metric_result = self.metric_trec.compute(predictions=run, references=qrel)
+        runs = [{"raw_data": raw, "estimate_score": score.tolist(), "predictions": prediction} for raw, score, prediction in zip(hyp_ref_raw, scores, predictions)]
+        for run in runs:
+            run["raw_data"] = {key: val.tolist() if isinstance(val, np.ndarray) else val for key, val in run["raw_data"].items()}
+        with open("/scratch/ace14856qn/openi_tg_result.json", "a") as f:
+            f.writelines("\n".join([json.dumps(run) for run in runs]))
+        # print (true_scores[0])
+        # self.overall_result["mrr"].append(metric_result["recip_rank"])
+        # self.overall_result["num"].append(metric_result["num_q"])
+        # mrr = np.array(self.overall_result["mrr"])
+        # num_q = np.array(self.overall_result["num"])
+        # overall_mrr = sum(mrr * num_q) / sum(num_q)
+        
+        # print (metric_result["recip_rank"], overall_mrr)
+        # scores = scores.cpu().detach().numpy()
+        # print (select_index[:2], scores[:2], tokens.shape)
+        # select_index = select_index.to(tokens.device) + torch.arange(batch_size).to(tokens.device) * candidate_num
+        # select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
         # print(select_index)
         # print(select_tokens)
+        # select_index = torch.arange(batch_size).to(tokens.device) * candidate_num
+        # select_tokens = torch.index_select(tokens, 0, torch.Tensor(select_index).int().to(tokens.device))
         return select_tokens
 
 
@@ -224,8 +376,8 @@ class CTTrainer(Seq2SeqTrainer):
         # candidates = [[v.strip() for v in val] for val in candidates]
         #print(len(candidates), decoded_origin_tokens.shape())
         scores = self.scorer(decoded_tokens, origin_tokens)[1][2]
-        with open("/scratch/ace14856qn/hyp_ref.json") as f:
-            hyp_ref = json.loads(f.readlines()[0])
+        # with open("/scratch/ace14856qn/hyp_ref.json") as f:
+        #     hyp_ref = json.loads(f.readlines()[0])
         hyp_ref.extend(
            zip(
            decoded_tokens,
@@ -233,8 +385,8 @@ class CTTrainer(Seq2SeqTrainer):
            scores
            )
         )
-        with open("/scratch/ace14856qn/hyp_ref.json", "w") as f:
-            f.write(json.dumps(hyp_ref))
+        # with open("/scratch/ace14856qn/hyp_ref.json", "w") as f:
+        #    f.write(json.dumps(hyp_ref))
         # scores = [
         #     partial_scorer(candidate, decoded_origin_tokens)[1]
         #     for candidate in candidates]
@@ -302,7 +454,7 @@ class CTTrainer(Seq2SeqTrainer):
         else:
             generation_inputs = inputs[self.model.main_input_name]
 
-        gen_kwargs["output_hidden_states"] = True
+        # gen_kwargs["output_hidden_states"] = True
         
 # outputs = self.model.generate(
  #             generation_inputs,
@@ -310,18 +462,20 @@ class CTTrainer(Seq2SeqTrainer):
  #             **gen_kwargs,
   #      )
   #       greedy_out = self.tokenizer.batch_decode(outputs["sequences"], skip_special_tokens=True)
-        gen_kwargs["num_beams"] = 5
+        gen_kwargs["num_beams"] = 10
+        # gen_kwargs["max_length"] = 40
 
         outputs = self.model.generate(
              generation_inputs,
              return_dict_in_generate=True, 
-             output_attentions=True,
              num_return_sequences=gen_kwargs["num_beams"],
-             # num_beam_groups=gen_kwargs["num_beams"],
+             do_sample=False,
+             # num_beam_groups=1,
              # diversity_penalty=2.0,
              # no_repeat_ngram_size=2,
              **gen_kwargs,
         )
+        # print (len(outputs["sequences"]))
    #      beam_out = self.tokenizer.batch_decode(outputs["sequences"], skip_special_tokens=True)
     #     print([val in beam_out for val in greedy_out])
 
@@ -339,13 +493,14 @@ class CTTrainer(Seq2SeqTrainer):
 
         # encoder_input_ids = generation_inputs
         # input_ids = torch.ones((gen_kwargs["num_return_sequences"], 1), device=model.device, dtype=torch.long)
-        if_contrastive = self.state.epoch >= 0
+        # if_contrastive = self.state.epoch >= 1000
+        if_contrastive = True
         #p --finetune --load_from pttm_epoch200_100topics.pirint(encoder_outputs.shape)
         #encoder_outputs = encoder_outputs.repeat_interleave(gen_kwargs["num_beams"], dim=0)
         # encoder_outputs = torch.mean(encoder_outputs.repeat_interleave(num_beams, dim=0), 1)
         #print(outputs["decoder_hidden_states"][0][-1].shape)
         #print(encoder_outputs.shape, sum([val[-1] for val in outputs["decoder_hidden_states"]]).shape)
-        generated_tokens = self.rerank(generated_tokens,outputs,gen_kwargs["num_beams"],contra=if_contrastive)
+        generated_tokens = self.rerank(generated_tokens,generation_inputs,inputs["labels"],gen_kwargs["num_beams"],contra=if_contrastive)
             
 
         with torch.no_grad():
@@ -408,10 +563,10 @@ class CTTrainer(Seq2SeqTrainer):
 try:
     nltk.data.find("tokenizers/punkt")
 except (LookupError, OSError):
-    if is_offline_mode():
-        raise LookupError(
-            "Offline mode: run this script without TRANSFORMERS_OFFLINE first to download nltk data files"
-        )
+    # if is_offline_mode():
+    #     raise LookupError(
+    #         "Offline mode: run this script without TRANSFORMERS_OFFLINE first to download nltk data files"
+    #     )
     with FileLock(".lock") as lock:
         nltk.download("punkt", quiet=True)
 
@@ -653,7 +808,7 @@ def main():
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_summarization", model_args, data_args)
+    # send_example_telemetry("run_summarization", model_args, data_args)
 
     # Setup logging
     logging.basicConfig(
@@ -959,9 +1114,11 @@ def main():
         return preds, labels
 
     def compute_metrics(eval_preds):
-        preds, labels = eval_preds
+        preds, labels, inputs = eval_preds
         if isinstance(preds, tuple):
             preds = preds[0]
+        print (inputs.shape, preds.shape, labels.shape)
+        ml = max(preds.shape[1], labels.shape[1])
         decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
         if data_args.ignore_pad_token_for_loss:
             # Replace -100 in the labels as we can't decode them.
@@ -971,14 +1128,23 @@ def main():
         # Some simple post-processing
         decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
 
+        # scorer = AutoModelForSequenceClassification.from_pretrained("/scratch/ace14856qn/scorer_results/checkpoint-5500")
+        # scorer_tokenizer = AutoTokenizer.from_pretrained("/scratch/ace14856qn/scorer_results/checkpoint-5500")
+        # decoded_tokens = scorer_tokenizer(decoded_preds, decoded_labels, padding="max_length", truncation=True, max_length=ml, return_tensors="pt")
+        # scores = scorer(**decoded_tokens)['logits']
+        # scores = scores.reshape(batch_size, 5)
+
         result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
         result_bert = metric_bert.compute(predictions=decoded_preds, references=decoded_labels, lang="en")
         result_radentity = {}
         #print (len(decoded_labels), len(decoded_preds))
         #result_radentity["entity_harmonic_mean"] = RadEntityMatchExact()(refs=decoded_labels, hyps=decoded_preds)[0]
         #result_radentity["nli_harmonic_mean"] = RadEntityNLI()(refs=decoded_labels, hyps=decoded_preds)[0]
+        rad_ref_tokens = [" ".join(val.split()) for val in decoded_labels]
+        rad_hyp_tokens = [" ".join(val.split()) for val in decoded_preds]
         result_radentity["radgraph_simple"], result_radentity["radgraph_partial"], result_radentity["radgraph_complete"] = \
-            RadGraph(reward_level="full")(refs=decoded_labels, hyps=decoded_preds)[0]
+            RadGraph(reward_level="full")(refs=rad_ref_tokens, hyps=rad_hyp_tokens)[0]
+
         result_chexbert = {}
         accuracy, accuracy_per_sample, chexbert_all, chexbert_5 = CheXbert()(hyps=decoded_preds, refs=decoded_labels)
         result_chexbert["chexbert_five_f1"] = chexbert_5["micro avg"]["f1-score"]
