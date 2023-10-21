@@ -1,5 +1,5 @@
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:/home/ace14856qn/miniconda3/lib
-CUDA_VISIBLE_DEVICES=0,1,2,3 python st_entity_scorer.py --model_name_or_path /scratch/ace14856qn/results/ --dataset_name /scratch/ace14856qn/scorer_pair_process_dataset --test_dataset_name /scratch/ace14856qn/scorer_true_pair_dataset --output_dir /scratch/ace14856qn/cross_entity_scorer_results/\
+CUDA_VISIBLE_DEVICES=0,1,2,3 python st_entity_scorer.py --model_name_or_path /scratch/ace14856qn/results/ --dataset_name /scratch/ace14856qn/scorer_process_openi_pair_dataset --test_dataset_name /scratch/ace14856qn/scorer_true_openi_pair_dataset --output_dir /scratch/ace14856qn/cross_entity_openi_scorer_results/\
     --per_device_train_batch_size=32\
     --per_device_eval_batch_size=512\
     --remove_unused_columns=False\

@@ -25,7 +25,7 @@ def read_hyps_refs(path):
     print(f"Read hyps and refs from {path}")
     samples = []
 
-    with open(f"{path}/hyp_ref.json") as f:
+    with open(f"{path}/openi_test_hyp_ref.json") as f:
         for line in f.readlines():
             samples.extend(json.loads(line))
 
@@ -163,7 +163,7 @@ def from_samples_to_triple_dataset(samples):
     dataset = form_dataset(samples)
     # dataset = DatasetDict({"train": train_dataset, "validation": valid_dataset, "test": test_dataset})
     print (dataset)
-    # dataset.save_to_disk(f"/scratch/ace14856qn/scorer_process_pair_dataset")
+    dataset.save_to_disk(f"/scratch/ace14856qn/scorer_true_openi_pair_dataset")
     return dataset
 
 def from_samples_to_dataset(samples):

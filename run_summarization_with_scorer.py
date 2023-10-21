@@ -114,15 +114,15 @@ class TestCallback(TrainerCallback):
 
 class CTTrainer(Seq2SeqTrainer):
     radgraph_scorer = RadGraph(reward_level="full", batch_size=1)
-    config = AutoConfig.from_pretrained("/scratch/ace14856qn/cross_entity_scorer_results")
-    scorer_tokenizer = AutoTokenizer.from_pretrained("/scratch/ace14856qn/cross_entity_scorer_results")
-    scorer = AutoModelForSeq2SeqLM.from_pretrained("/scratch/ace14856qn/cross_entity_scorer_results/checkpoint-6500", config=config)
+    config = AutoConfig.from_pretrained("/scratch/ace14856qn/cross_entity_scorer_openi_results")
+    scorer_tokenizer = AutoTokenizer.from_pretrained("/scratch/ace14856qn/cross_entity_scorer_openi_results")
+    scorer = AutoModelForSeq2SeqLM.from_pretrained("/scratch/ace14856qn/cross_entity_scorer_openi_results/checkpoint-150", config=config)
     # scorer = AutoModelForSequenceClassification.from_pretrained("/scratch/ace14856qn/scorer_results")
     # scorer_tokenizer = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
     # scorer = EntityCrossEncoder.from_pretrained("/scratch/ace14856qn/cross_entity_scorer_results/checkpoint-2500", model_name_or_path="emilyalsentzer/Bio_ClinicalBERT").to("cuda")
     # scorer = SentenceTransformer("/scratch/ace14856qn/entity_scorer_results/")
     # scorer = CrossEncoder("/scratch/ace14856qn/entity_scorer_results/")
-    metric_trec = evaluate.load("trec_eval")
+    # metric_trec = evaluate.load("trec_eval")
     overall_result = {"mrr": [], "num": []}
     sequences = []
     original_sequences = []
@@ -190,6 +190,7 @@ class CTTrainer(Seq2SeqTrainer):
     def rerank(self, tokens, original_tokens, labels, candidate_num, contra):
         overall_batch_size, max_sequence_length = tokens.shape
         batch_size = overall_batch_size // candidate_num
+        print (batch_size, overall_batch_size, candidate_num)
         max_ori_length = original_tokens.shape[1]
         if not contra:
             select_index = torch.arange(batch_size).to(tokens.device) * candidate_num
@@ -202,25 +203,25 @@ class CTTrainer(Seq2SeqTrainer):
         hyps = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
         batch_size = len(hyps)
         hyps = np.repeat(hyps, candidate_num)
-        _, true_scores, _, true_graph = self.radgraph_scorer(refs=hyps, hyps=decoded_tokens, fill_cache=False)
+        # _, true_scores, _, true_graph = self.radgraph_scorer(refs=hyps, hyps=decoded_tokens, fill_cache=False)
         # true_scores = true_scores[1]
-        rad_ref_tokens = [" ".join(val.split()) for val in decoded_original_tokens]
-        rad_hyp_tokens = [" ".join(val.split()) for val in decoded_tokens]
-        _, _, hyp_graph, ref_graph = self.radgraph_scorer(refs=rad_ref_tokens, hyps=rad_hyp_tokens, fill_cache=False)
+        # rad_ref_tokens = [" ".join(val.split()) for val in decoded_original_tokens]
+        # rad_hyp_tokens = [" ".join(val.split()) for val in decoded_tokens]
+        # _, _, hyp_graph, ref_graph = self.radgraph_scorer(refs=rad_ref_tokens, hyps=rad_hyp_tokens, fill_cache=False)
         # _, true_scores, _, _ = true_scores
         # true_scores = np.array(true_scores[1][1]).reshape(batch_size,candidate_num)
         # rad_ref_tokens = [val[:230]
         # _, true_scores, _, _ = true_scores
-        true_scores = np.array(true_scores[1]).reshape(batch_size,candidate_num)
-        one_hot = (true_scores == true_scores.max(axis=1)[:,None]).astype(int)
-        qrel = [
-            {
-                "query": np.repeat(list(range(batch_size)), candidate_num),
-                "q0": ["q0"] * (batch_size * candidate_num),
-                "docid": [str(val) for val in list(range(batch_size * candidate_num))],
-                "rel": one_hot.reshape(-1),
-            }
-        ]
+        # true_scores = np.array(true_scores[1]).reshape(batch_size,candidate_num)
+        # one_hot = (true_scores == true_scores.max(axis=1)[:,None]).astype(int)
+        # qrel = [
+        #     {
+        #         "query": np.repeat(list(range(batch_size)), candidate_num),
+        #         "q0": ["q0"] * (batch_size * candidate_num),
+        #         "docid": [str(val) for val in list(range(batch_size * candidate_num))],
+        #         "rel": one_hot.reshape(-1),
+        #     }
+        # ]
         print ("Extract graph via RadGraph")
 
         # decoded_tokens = self.scorer_tokenizer(decoded_tokens, decoded_original_tokens, padding="max_length", truncation=True, max_length=max_ori_length, return_tensors="pt")
@@ -251,7 +252,7 @@ class CTTrainer(Seq2SeqTrainer):
         # hyp_ref = []
         # hyp_ref = sorted(list(zip(decoded_tokens, decoded_original_tokens, hyps)))
         hyp_ref = list(zip(decoded_tokens, decoded_original_tokens, hyps))
-        # with open("/scratch/ace14856qn/hyp_ref.json", "a") as f:
+        # with open("/scratch/ace14856qn/openi_train_hyp_ref.json", "a") as f:
         #     f.write(json.dumps(hyp_ref))
         #     f.write('\n')
         # select_index = torch.arange(batch_size).to(tokens.device) * candidate_num
@@ -323,33 +324,34 @@ class CTTrainer(Seq2SeqTrainer):
                 "query": np.repeat(list(range(batch_size)), candidate_num),
                 "q0": ["q0"] * (batch_size * candidate_num),
                 "docid": [str(val) for val in list(range(batch_size * candidate_num))],
-                "rank": scores.argsort(axis=-1).argsort(axis=-1).reshape(-1),
-                # "rank": candidate_num - np.array(list(range(candidate_num)) * batch_size) - 1, 
-                "score": scores.reshape(-1), 
-                # "score": candidate_num - np.array(list(range(candidate_num)) * batch_size),
+                # "rank": scores.argsort(axis=-1).argsort(axis=-1).reshape(-1),
+                "rank": candidate_num - np.array(list(range(candidate_num)) * batch_size) - 1, 
+                # # "score": scores.reshape(-1), 
+                "score": candidate_num - np.array(list(range(candidate_num)) * batch_size),
                 "system": ["test"] * (batch_size * candidate_num),
             }
         ]
+        print (scores.shape, batch_size, candidate_num)
         scores = scores.reshape(batch_size, candidate_num)
         # scores = scores.reshape(batch_size,candidate_num)
 
 
         select_index = torch.Tensor(scores.argmax(axis=1)).long()
         select_tokens = tokens.reshape(batch_size, candidate_num, -1)[torch.arange(batch_size), select_index]
-        metric_result = self.metric_trec.compute(predictions=run, references=qrel)
+        # metric_result = self.metric_trec.compute(predictions=run, references=qrel)
         runs = [{"raw_data": raw, "estimate_score": score.tolist(), "predictions": prediction} for raw, score, prediction in zip(hyp_ref_raw, scores, predictions)]
         for run in runs:
             run["raw_data"] = {key: val.tolist() if isinstance(val, np.ndarray) else val for key, val in run["raw_data"].items()}
-        with open("/scratch/ace14856qn/tg_result.json", "a") as f:
+        with open("/scratch/ace14856qn/openi_tg_result.json", "a") as f:
             f.writelines("\n".join([json.dumps(run) for run in runs]))
         # print (true_scores[0])
-        self.overall_result["mrr"].append(metric_result["recip_rank"])
-        self.overall_result["num"].append(metric_result["num_q"])
-        mrr = np.array(self.overall_result["mrr"])
-        num_q = np.array(self.overall_result["num"])
-        overall_mrr = sum(mrr * num_q) / sum(num_q)
+        # self.overall_result["mrr"].append(metric_result["recip_rank"])
+        # self.overall_result["num"].append(metric_result["num_q"])
+        # mrr = np.array(self.overall_result["mrr"])
+        # num_q = np.array(self.overall_result["num"])
+        # overall_mrr = sum(mrr * num_q) / sum(num_q)
         
-        print (metric_result["recip_rank"], overall_mrr)
+        # print (metric_result["recip_rank"], overall_mrr)
         # scores = scores.cpu().detach().numpy()
         # print (select_index[:2], scores[:2], tokens.shape)
         # select_index = select_index.to(tokens.device) + torch.arange(batch_size).to(tokens.device) * candidate_num
